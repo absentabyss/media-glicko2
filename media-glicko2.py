@@ -30,6 +30,7 @@ from __future__ import annotations
 import math
 import random
 import re
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -244,17 +245,40 @@ def _load_video_frames(path: Path, target_size: Tuple[int, int], max_frames: int
     if iio is None:
         return []
 
-    metadata = iio.immeta(path)
-    fps = float(metadata.get("fps", 24) or 24)
-    frame_delay_ms = max(int(1000 / fps), 16)
+    plugin_candidates = [None, "pyav", "ffmpeg"]
 
-    frames: List[Tuple[Image.Image, int]] = []
-    for index, ndarray_frame in enumerate(iio.imiter(path)):
-        if index >= max_frames:
-            break
-        frame_img = Image.fromarray(ndarray_frame).convert("RGB")
-        frames.append((_center_on_canvas(frame_img, target_size), frame_delay_ms))
-    return frames
+    for plugin in plugin_candidates:
+        kwargs = {} if plugin is None else {"plugin": plugin}
+
+        fps = 24.0
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                metadata = iio.immeta(path, **kwargs)
+            fps = float(metadata.get("fps", 24) or 24)
+        except Exception:
+            fps = 24.0
+
+        if fps <= 0:
+            fps = 24.0
+        frame_delay_ms = max(int(1000 / fps), 16)
+
+        frames: List[Tuple[Image.Image, int]] = []
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                for index, ndarray_frame in enumerate(iio.imiter(path, **kwargs)):
+                    if index >= max_frames:
+                        break
+                    frame_img = Image.fromarray(ndarray_frame).convert("RGB")
+                    frames.append((_center_on_canvas(frame_img, target_size), frame_delay_ms))
+        except Exception:
+            frames = []
+
+        if frames:
+            return frames
+
+    return []
 
 
 def load_media_frames(path: Path, target_size: Tuple[int, int], max_frames: int = 240) -> List[Tuple[Image.Image, int]]:
