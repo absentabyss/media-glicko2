@@ -648,7 +648,8 @@ class ImageRankerApp:
 
         self.left_photo = None
         self.right_photo = None
-        self._vlc_instance = self._create_vlc_instance()
+        self._vlc_enabled = VLC_AVAILABLE
+        self._vlc_instance = self._create_vlc_instance() if VLC_AVAILABLE else None
         self.left_vlc_player = None
         self.right_vlc_player = None
         self.left_vlc_media = None
@@ -766,7 +767,7 @@ class ImageRankerApp:
         self.master.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _create_vlc_instance(self):
-        if not VLC_AVAILABLE:
+        if not self._vlc_enabled:
             return None
         instance_options = list(VLC_INSTANCE_OPTIONS)
         if sys.platform.startswith("win"):
@@ -894,6 +895,11 @@ class ImageRankerApp:
         return ordered
 
     def _start_preload_upcoming_videos(self, lookahead: int = VIDEO_PRELOAD_LOOKAHEAD) -> None:
+        if self._vlc_enabled:
+            # VLC is the active playback path. Avoid parallel software decoding
+            # of upcoming videos, which can contend with VLC's VP8 decode on
+            # Windows and cause stalls during rapid media switches.
+            return
         if not self.folder or not self.pairs:
             return
         self._preload_generation += 1
@@ -1046,7 +1052,7 @@ class ImageRankerApp:
         self._set_vlc_media_for_side(side, None)
 
     def _play_video_on_frame(self, path: Path, side: str) -> bool:
-        if not VLC_AVAILABLE or self._vlc_instance is None:
+        if not self._vlc_enabled or self._vlc_instance is None:
             return False
 
         media_frame = self._media_frame_for_side(side)
