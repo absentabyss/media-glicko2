@@ -1,0 +1,600 @@
+#!/usr/bin/env python3
+"""
+image_glicko2_ranker_full.py
+
+Windows-friendly Tkinter app for pairwise image ranking with Glicko-2.
+
+Behavior:
+- Choose a folder containing images
+- One session shuffles the images and makes random disjoint pairs
+- Each image appears at most once per session
+- If the image count is odd, one image sits out for that session
+- Click left/right image, or use arrow keys:
+    Left  = left image wins
+    Right = right image wins
+    Up    = draw
+    Down  = undo last comparison
+- After the session, ratings update with Glicko-2
+- Files are renamed with a prefixed metadata block so filesystem sorting works
+- The same folder remains loaded, and a new session starts immediately
+
+Requirements:
+    pip install pillow
+
+Supported formats:
+    .jpg .jpeg .png .bmp .gif .webp
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+try:
+    from PIL import Image, ImageOps, ImageTk
+except ImportError:
+    raise SystemExit("Pillow is required. Install it with: pip install pillow")
+
+
+# =========================
+# GLICKO-2 IMPLEMENTATION
+# =========================
+
+GLICKO2_SCALE = 173.7178
+
+
+@dataclass
+class Glicko2Player:
+    rating: float = 1500.0
+    rd: float = 350.0
+    sigma: float = 0.06
+    matches: List[Tuple[float, float, float]] = field(default_factory=list)
+    # each match = (opponent_rating, opponent_rd, score)
+
+    def add_result(self, opponent_rating: float, opponent_rd: float, score: float) -> None:
+        self.matches.append((opponent_rating, opponent_rd, score))
+
+    def clear_matches(self) -> None:
+        self.matches.clear()
+
+
+def _to_mu(rating: float) -> float:
+    return (rating - 1500.0) / GLICKO2_SCALE
+
+
+def _to_phi(rd: float) -> float:
+    return rd / GLICKO2_SCALE
+
+
+def _to_rating(mu: float) -> float:
+    return mu * GLICKO2_SCALE + 1500.0
+
+
+def _to_rd(phi: float) -> float:
+    return phi * GLICKO2_SCALE
+
+
+def _g(phi_j: float) -> float:
+    return 1.0 / math.sqrt(1.0 + 3.0 * (phi_j ** 2) / (math.pi ** 2))
+
+
+def _E(mu: float, mu_j: float, phi_j: float) -> float:
+    return 1.0 / (1.0 + math.exp(-_g(phi_j) * (mu - mu_j)))
+
+
+def _compute_v(mu: float, opps: List[Tuple[float, float, float]]) -> float:
+    total = 0.0
+    for r_j, rd_j, _ in opps:
+        mu_j = _to_mu(r_j)
+        phi_j = _to_phi(rd_j)
+        E_val = _E(mu, mu_j, phi_j)
+        g_val = _g(phi_j)
+        total += (g_val ** 2) * E_val * (1.0 - E_val)
+    return 1.0 / total
+
+
+def _compute_delta(mu: float, opps: List[Tuple[float, float, float]], v: float) -> float:
+    total = 0.0
+    for r_j, rd_j, s_j in opps:
+        mu_j = _to_mu(r_j)
+        phi_j = _to_phi(rd_j)
+        total += _g(phi_j) * (s_j - _E(mu, mu_j, phi_j))
+    return v * total
+
+
+def _f(x: float, delta: float, phi: float, v: float, a: float, tau: float) -> float:
+    ex = math.exp(x)
+    num = ex * (delta * delta - phi * phi - v - ex)
+    den = 2.0 * ((phi * phi + v + ex) ** 2)
+    return (num / den) - ((x - a) / (tau * tau))
+
+
+def update_glicko2_player(player: Glicko2Player, tau: float = 0.5) -> None:
+    """
+    Batch-update a player for one rating period using standard Glicko-2.
+    """
+    mu = _to_mu(player.rating)
+    phi = _to_phi(player.rd)
+    sigma = player.sigma
+
+    # No games this period: only RD increases due to inactivity.
+    if not player.matches:
+        phi_star = math.sqrt(phi * phi + sigma * sigma)
+        player.rd = min(_to_rd(phi_star), 350.0)
+        return
+
+    v = _compute_v(mu, player.matches)
+    delta = _compute_delta(mu, player.matches, v)
+
+    a = math.log(sigma * sigma)
+    eps = 1e-6
+
+    A = a
+    if delta * delta > phi * phi + v:
+        B = math.log(delta * delta - phi * phi - v)
+    else:
+        k = 1
+        while _f(a - k * tau, delta, phi, v, a, tau) < 0:
+            k += 1
+        B = a - k * tau
+
+    fA = _f(A, delta, phi, v, a, tau)
+    fB = _f(B, delta, phi, v, a, tau)
+
+    while abs(B - A) > eps:
+        C = A + (A - B) * fA / (fB - fA)
+        fC = _f(C, delta, phi, v, a, tau)
+        if fC * fB < 0:
+            A = B
+            fA = fB
+        else:
+            fA = fA / 2.0
+        B = C
+        fB = fC
+
+    sigma_prime = math.exp(A / 2.0)
+
+    phi_star = math.sqrt(phi * phi + sigma_prime * sigma_prime)
+    phi_prime = 1.0 / math.sqrt((1.0 / (phi_star * phi_star)) + (1.0 / v))
+
+    total = 0.0
+    for r_j, rd_j, s_j in player.matches:
+        mu_j = _to_mu(r_j)
+        phi_j = _to_phi(rd_j)
+        total += _g(phi_j) * (s_j - _E(mu, mu_j, phi_j))
+
+    mu_prime = mu + (phi_prime * phi_prime) * total
+
+    player.rating = _to_rating(mu_prime)
+    player.rd = min(_to_rd(phi_prime), 350.0)
+    player.sigma = sigma_prime
+
+
+# =========================
+# FILE / IMAGE HELPERS
+# =========================
+
+SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+
+# Example prefix:
+# "[G2_R1500.0_RD200.3_S0.0600] "
+STATS_PREFIX_RE = re.compile(r"^\[G2_R(-?\d+(?:\.\d+)?)_RD(\d+(?:\.\d+)?)_S(\d+(?:\.\d+)?)\]\s+")
+
+
+def strip_existing_prefix(stem: str) -> str:
+    return STATS_PREFIX_RE.sub("", stem)
+
+
+def format_prefix(player: Glicko2Player) -> str:
+    return f"[G2_R{player.rating:.1f}_RD{player.rd:.1f}_S{player.sigma:.4f}] "
+
+
+def player_from_path(path: Path) -> Glicko2Player:
+    m = STATS_PREFIX_RE.match(path.stem)
+    if not m:
+        return Glicko2Player()
+    rating = float(m.group(1))
+    rd = float(m.group(2))
+    sigma = float(m.group(3))
+    return Glicko2Player(rating=rating, rd=rd, sigma=sigma)
+
+
+def load_images(folder: Path) -> List[Path]:
+    files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    return sorted(files, key=lambda p: p.name.lower())
+
+
+def build_random_pairs_once(paths: List[Path]) -> List[Tuple[Path, Path]]:
+    shuffled = paths[:]
+    random.shuffle(shuffled)
+    pairs: List[Tuple[Path, Path]] = []
+    for i in range(0, len(shuffled) - 1, 2):
+        pairs.append((shuffled[i], shuffled[i + 1]))
+    return pairs
+
+
+def shorten_name(name: str, max_len: int = 80) -> str:
+    if len(name) <= max_len:
+        return name
+    keep = max_len - 3
+    left = keep // 2
+    right = keep - left
+    return name[:left] + "..." + name[-right:]
+
+
+# =========================
+# UI APPLICATION
+# =========================
+
+class ImageRankerApp:
+    def __init__(self, master: tk.Tk):
+        self.master = master
+        self.master.title("Image Glicko-2 Ranker")
+        self.master.geometry("1400x800")
+        self.master.minsize(1000, 650)
+        self.master.configure(bg="#202020")
+
+        self.folder: Path | None = None
+        self.image_paths: List[Path] = []
+        self.players: Dict[Path, Glicko2Player] = {}
+        self.pairs: List[Tuple[Path, Path]] = []
+        self.current_index = 0
+        self.history: List[Tuple[Path, Path]] = []
+
+        self.left_photo = None
+        self.right_photo = None
+        self._resize_after_id = None
+        self._last_root_size = (self.master.winfo_width(), self.master.winfo_height())
+
+        self.top_bar = tk.Frame(self.master, bg="#202020")
+        self.top_bar.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
+
+        self.btn_choose = tk.Button(
+            self.top_bar, text="Choose Folder", command=self.choose_folder, font=("Segoe UI", 11)
+        )
+        self.btn_choose.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.status_var = tk.StringVar(value="Choose a folder with images.")
+        self.status_label = tk.Label(
+            self.top_bar, textvariable=self.status_var, fg="white", bg="#202020", font=("Segoe UI", 11)
+        )
+        self.status_label.pack(side=tk.LEFT, padx=8)
+
+        self.progress_var = tk.StringVar(value="")
+        self.progress_label = tk.Label(
+            self.top_bar, textvariable=self.progress_var, fg="#cccccc", bg="#202020", font=("Segoe UI", 10)
+        )
+        self.progress_label.pack(side=tk.RIGHT, padx=8)
+
+        self.main_frame = tk.Frame(self.master, bg="#202020")
+        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.main_frame.grid_columnconfigure(0, weight=1, uniform="panels")
+        self.main_frame.grid_columnconfigure(1, weight=1, uniform="panels")
+        self.main_frame.grid_rowconfigure(0, weight=1)
+
+        self.left_panel = tk.Frame(self.main_frame, bg="#151515", bd=1, relief=tk.FLAT)
+        self.left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+
+        self.right_panel = tk.Frame(self.main_frame, bg="#151515", bd=1, relief=tk.FLAT)
+        self.right_panel.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+
+        self.left_label = tk.Label(
+            self.left_panel,
+            bg="#151515",
+            fg="white",
+            text="Left image",
+            font=("Segoe UI", 12),
+            anchor="w",
+            justify="left",
+            wraplength=550,
+        )
+        self.left_label.pack(side=tk.TOP, fill=tk.X, padx=10, pady=8)
+
+        self.right_label = tk.Label(
+            self.right_panel,
+            bg="#151515",
+            fg="white",
+            text="Right image",
+            font=("Segoe UI", 12),
+            anchor="w",
+            justify="left",
+            wraplength=550,
+        )
+        self.right_label.pack(side=tk.TOP, fill=tk.X, padx=10, pady=8)
+
+        self.left_image_label = tk.Label(self.left_panel, bg="#151515", cursor="hand2")
+        self.left_image_label.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.left_image_label.bind("<Button-1>", lambda e: self.pick_winner("left"))
+
+        self.right_image_label = tk.Label(self.right_panel, bg="#151515", cursor="hand2")
+        self.right_image_label.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.right_image_label.bind("<Button-1>", lambda e: self.pick_winner("right"))
+
+        self.bottom_bar = tk.Frame(self.master, bg="#202020")
+        self.bottom_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 10))
+
+        self.draw_button = tk.Button(
+            self.bottom_bar,
+            text="Draw / Tie",
+            command=self.record_draw,
+            font=("Segoe UI", 10),
+        )
+        self.draw_button.pack(side=tk.RIGHT, padx=(8, 0))
+
+        self.help_label = tk.Label(
+            self.bottom_bar,
+            text="Left/Right arrows choose winner. Up = draw. Down = undo. Mouse click still works. Each image appears at most once per session. Esc exits.",
+            fg="#cccccc",
+            bg="#202020",
+            font=("Segoe UI", 10),
+        )
+        self.help_label.pack(side=tk.LEFT)
+
+        self.master.bind("<Escape>", lambda e: self.master.destroy())
+        self.master.bind("<Left>", lambda e: self.pick_winner("left"))
+        self.master.bind("<Right>", lambda e: self.pick_winner("right"))
+        self.master.bind("<Up>", lambda e: self.record_draw())
+        self.master.bind("<Down>", lambda e: self.undo_last())
+        self.master.bind("<Configure>", self._on_resize)
+
+    def build_session_pairs(self, image_paths: List[Path]) -> List[Tuple[Path, Path]]:
+        return build_random_pairs_once(image_paths)
+
+    def choose_folder(self) -> None:
+        folder_str = filedialog.askdirectory(title="Choose image folder")
+        if not folder_str:
+            return
+
+        folder = Path(folder_str)
+        image_paths = load_images(folder)
+
+        if len(image_paths) < 2:
+            messagebox.showerror("Not enough images", "Need at least 2 supported image files.")
+            return
+
+        self.folder = folder
+        self.image_paths = image_paths
+        self.players = {p: player_from_path(p) for p in image_paths}
+        self.pairs = self.build_session_pairs(image_paths)
+        self.current_index = 0
+        self.history = []
+
+        self.status_var.set(f"Loaded {len(self.image_paths)} images from: {self.folder}")
+        self._update_progress()
+        self.show_current_pair()
+
+    def _update_progress(self) -> None:
+        total_pairs = len(self.pairs)
+        done = self.current_index
+        images_this_session = total_pairs * 2
+        if self.image_paths and len(self.image_paths) % 2 == 1:
+            images_this_session += 1
+        self.progress_var.set(
+            f"Compared: {done}/{total_pairs} | Images in session: {images_this_session}/{len(self.image_paths)}"
+        )
+
+    def _on_resize(self, event) -> None:
+        # Redraw only when the root window itself changes size.
+        if event.widget is not self.master:
+            return
+
+        new_size = (event.width, event.height)
+        if new_size == self._last_root_size:
+            return
+        self._last_root_size = new_size
+
+        if self._resize_after_id is not None:
+            self.master.after_cancel(self._resize_after_id)
+
+        self._resize_after_id = self.master.after(120, self._redraw_current_pair)
+
+    def _redraw_current_pair(self) -> None:
+        self._resize_after_id = None
+        if self.pairs and self.current_index < len(self.pairs):
+            self.show_current_pair(redraw_only=True)
+
+    def show_current_pair(self, redraw_only: bool = False) -> None:
+        if not self.pairs or self.current_index >= len(self.pairs):
+            if not redraw_only:
+                self.finish_session()
+            return
+
+        left_path, right_path = self.pairs[self.current_index]
+
+        panel_width = max(self.main_frame.winfo_width() // 2 - 40, 250)
+        self.left_label.config(wraplength=panel_width, text=f"Left: {shorten_name(left_path.name, 80)}")
+        self.right_label.config(wraplength=panel_width, text=f"Right: {shorten_name(right_path.name, 80)}")
+
+        self.left_photo = self._load_display_image(left_path, self.left_image_label)
+        self.right_photo = self._load_display_image(right_path, self.right_image_label)
+
+        self.left_image_label.config(image=self.left_photo)
+        self.right_image_label.config(image=self.right_photo)
+
+        self._update_progress()
+
+    def _load_display_image(self, path: Path, widget: tk.Label) -> ImageTk.PhotoImage:
+        widget.update_idletasks()
+        w = max(widget.winfo_width(), 200)
+        h = max(widget.winfo_height(), 200)
+
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception:
+            img = Image.new("RGB", (800, 600), color=(30, 30, 30))
+
+        fitted = ImageOps.contain(img, (max(w - 20, 1), max(h - 20, 1)))
+        canvas = Image.new("RGB", (w, h), color=(21, 21, 21))
+        x = (w - fitted.width) // 2
+        y = (h - fitted.height) // 2
+        canvas.paste(fitted, (x, y))
+        return ImageTk.PhotoImage(canvas)
+
+    def pick_winner(self, side: str) -> None:
+        if not self.pairs or self.current_index >= len(self.pairs):
+            return
+
+        left_path, right_path = self.pairs[self.current_index]
+        left_player = self.players[left_path]
+        right_player = self.players[right_path]
+
+        if side == "left":
+            left_player.add_result(right_player.rating, right_player.rd, 1.0)
+            right_player.add_result(left_player.rating, left_player.rd, 0.0)
+        elif side == "right":
+            left_player.add_result(right_player.rating, right_player.rd, 0.0)
+            right_player.add_result(left_player.rating, left_player.rd, 1.0)
+        else:
+            return
+
+        self.history.append((left_path, right_path))
+        self.current_index += 1
+        if self.current_index >= len(self.pairs):
+            self.finish_session()
+        else:
+            self.show_current_pair()
+
+    def record_draw(self) -> None:
+        if not self.pairs or self.current_index >= len(self.pairs):
+            return
+
+        left_path, right_path = self.pairs[self.current_index]
+        left_player = self.players[left_path]
+        right_player = self.players[right_path]
+
+        left_player.add_result(right_player.rating, right_player.rd, 0.5)
+        right_player.add_result(left_player.rating, left_player.rd, 0.5)
+
+        self.history.append((left_path, right_path))
+        self.current_index += 1
+        if self.current_index >= len(self.pairs):
+            self.finish_session()
+        else:
+            self.show_current_pair()
+
+    def undo_last(self) -> None:
+        if not self.history or self.current_index == 0:
+            return
+
+        self.current_index -= 1
+
+        left_path, right_path = self.history.pop()
+        left_player = self.players[left_path]
+        right_player = self.players[right_path]
+
+        if left_player.matches:
+            left_player.matches.pop()
+        if right_player.matches:
+            right_player.matches.pop()
+
+        self.show_current_pair()
+
+    def finish_session(self) -> None:
+        if not self.image_paths:
+            return
+
+        for path in self.image_paths:
+            update_glicko2_player(self.players[path], tau=0.5)
+
+        renamed, skipped = self.rename_files()
+
+        ranked = sorted(
+            ((p, self.players[p]) for p in self.image_paths),
+            key=lambda item: item[1].rating,
+            reverse=True,
+        )
+
+        lines = ["Session complete.", "", f"Renamed: {renamed}", f"Skipped: {skipped}", "", "Top results:"]
+        for i, (path, player) in enumerate(ranked[:10], start=1):
+            lines.append(
+                f"{i}. {path.name} | R={player.rating:.1f} RD={player.rd:.1f} S={player.sigma:.4f}"
+            )
+
+        summary = "\n".join(lines)
+        self.status_var.set("Session complete. Files renamed.")
+        self.progress_var.set("")
+        messagebox.showinfo("Done", summary)
+
+        # Refresh paths from folder because names changed, then keep the folder loaded.
+        self.image_paths = load_images(self.folder)
+        self.players = {p: player_from_path(p) for p in self.image_paths}
+        self.pairs = self.build_session_pairs(self.image_paths)
+        self.current_index = 0
+        self.history = []
+
+        if len(self.image_paths) >= 2 and self.pairs:
+            self.status_var.set(f"Updated ratings for {len(self.image_paths)} images in: {self.folder}")
+            self.show_current_pair()
+        else:
+            self.status_var.set("Need at least 2 supported image files in the selected folder.")
+            self.progress_var.set("")
+            self.left_label.config(text="Left image")
+            self.right_label.config(text="Right image")
+            self.left_image_label.config(image="")
+            self.right_image_label.config(image="")
+
+    def rename_files(self) -> Tuple[int, int]:
+        renamed = 0
+        skipped = 0
+
+        ranked_paths = sorted(self.image_paths, key=lambda p: self.players[p].rating, reverse=True)
+
+        rename_plan: List[Tuple[Path, Path]] = []
+        targets_seen = set()
+
+        for path in ranked_paths:
+            player = self.players[path]
+            clean_stem = strip_existing_prefix(path.stem)
+            new_name = format_prefix(player) + clean_stem + path.suffix.lower()
+            target = path.with_name(new_name)
+
+            if target in targets_seen:
+                suffix_num = 2
+                while True:
+                    alt = path.with_name(format_prefix(player) + clean_stem + f"_{suffix_num}" + path.suffix.lower())
+                    if alt not in targets_seen:
+                        target = alt
+                        break
+                    suffix_num += 1
+
+            targets_seen.add(target)
+            rename_plan.append((path, target))
+
+        temp_plan: List[Tuple[Path, Path]] = []
+        try:
+            for i, (src, final_dst) in enumerate(rename_plan):
+                if src == final_dst:
+                    temp_plan.append((src, final_dst))
+                    continue
+                temp = src.with_name(src.name + f".__g2tmp__{i}")
+                src.rename(temp)
+                temp_plan.append((temp, final_dst))
+
+            for current_src, final_dst in temp_plan:
+                if current_src == final_dst:
+                    continue
+                current_src.rename(final_dst)
+                renamed += 1
+
+        except Exception as exc:
+            messagebox.showerror("Rename error", f"Could not rename files.\n\n{exc}")
+            skipped = len(self.image_paths) - renamed
+
+        return renamed, skipped
+
+
+def main() -> None:
+    root = tk.Tk()
+    app = ImageRankerApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
