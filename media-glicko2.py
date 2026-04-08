@@ -561,7 +561,7 @@ class ImageRankerApp:
         self.right_animation_index = 0
         self._resize_after_id = None
         self._last_root_size = (self.master.winfo_width(), self.master.winfo_height())
-        self._load_generation = 0
+        self._load_generation: Dict[str, int] = {"left": 0, "right": 0}
 
         self.top_bar = tk.Frame(self.master, bg="#202020")
         self.top_bar.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
@@ -792,8 +792,8 @@ class ImageRankerApp:
         w = max(widget.winfo_width(), 200)
         h = max(widget.winfo_height(), 200)
         self._stop_animation(side)
-        self._load_generation += 1
-        load_generation = self._load_generation
+        self._load_generation[side] += 1
+        load_generation = self._load_generation[side]
 
         placeholder = Image.new("RGB", (w, h), color=(24, 24, 24))
         placeholder_photo = ImageTk.PhotoImage(placeholder)
@@ -807,7 +807,7 @@ class ImageRankerApp:
             frame_data = load_media_frames(path, (w, h))
 
             def apply_result() -> None:
-                if load_generation != self._load_generation:
+                if load_generation != self._load_generation[side]:
                     return
 
                 photos = [ImageTk.PhotoImage(frame) for frame, _ in frame_data]
