@@ -203,6 +203,8 @@ VIDEO_COMPILE_SIZE = (1200, 1200)
 VIDEO_CACHE_MAX_FRAMES = 90
 VIDEO_CACHE_TARGET_FPS = 14.0
 VIDEO_PRELOAD_LOOKAHEAD = 8
+DISPLAY_SIZE_BUCKET = 64
+PHOTOIMAGE_BATCH_SIZE = 6
 
 # Example prefix:
 # "[G2_R1500.0_RD200.3_S0.0600] "
@@ -244,6 +246,16 @@ def _center_on_canvas(img: Image.Image, canvas_size: Tuple[int, int]) -> Image.I
     y = (canvas_h - fitted.height) // 2
     canvas.paste(fitted, (x, y))
     return canvas
+
+
+def _bucket_dimension(value: int, bucket: int = DISPLAY_SIZE_BUCKET) -> int:
+    if value <= 0:
+        return bucket
+    return max(bucket, int(round(value / bucket) * bucket))
+
+
+def _bucket_size(size: Tuple[int, int], bucket: int = DISPLAY_SIZE_BUCKET) -> Tuple[int, int]:
+    return (_bucket_dimension(size[0], bucket=bucket), _bucket_dimension(size[1], bucket=bucket))
 
 
 def _load_gif_frames(path: Path, target_size: Tuple[int, int], max_frames: int = 240) -> List[Tuple[Image.Image, int]]:
@@ -808,6 +820,19 @@ class ImageRankerApp:
 
         # Load compile-sized frames to populate VIDEO_SOURCE_FRAME_CACHE.
         _load_video_frames_from_cache(path, VIDEO_COMPILE_SIZE)
+        # Warm display-sized cache too so runtime pairing is immediate.
+        target_size = self._current_preload_target_size()
+        load_media_frames(path, target_size)
+
+    def _current_preload_target_size(self) -> Tuple[int, int]:
+        left_w = self.left_image_label.winfo_width()
+        right_w = self.right_image_label.winfo_width()
+        left_h = self.left_image_label.winfo_height()
+        right_h = self.right_image_label.winfo_height()
+
+        w = max(left_w, right_w, self.main_frame.winfo_width() // 2 - 20, 200)
+        h = max(left_h, right_h, self.main_frame.winfo_height() - 20, 200)
+        return _bucket_size((w, h))
 
     def _stop_animation(self, side: str) -> None:
         if side == "left":
@@ -849,6 +874,7 @@ class ImageRankerApp:
         widget.update_idletasks()
         w = max(widget.winfo_width(), 200)
         h = max(widget.winfo_height(), 200)
+        target_size = _bucket_size((w, h))
         self._stop_animation(side)
         self._load_generation[side] += 1
         load_generation = self._load_generation[side]
@@ -862,38 +888,62 @@ class ImageRankerApp:
             self.right_photo = placeholder_photo
 
         def worker() -> None:
-            frame_data = load_media_frames(path, (w, h))
+            frame_data = load_media_frames(path, target_size)
 
             def apply_result() -> None:
                 if load_generation != self._load_generation[side]:
                     return
 
-                photos = [ImageTk.PhotoImage(frame) for frame, _ in frame_data]
-                delays = [delay for _, delay in frame_data]
-                if not photos:
+                if not frame_data:
                     return
 
+                first_photo = ImageTk.PhotoImage(frame_data[0][0])
+                photos = [first_photo]
+                delays = [frame_data[0][1]]
+
                 if side == "left":
-                    self.left_photo = photos[0]
+                    self.left_photo = first_photo
                     self.left_animation_frames = photos
                     self.left_animation_delays = delays
                     self.left_animation_index = 0
                 else:
-                    self.right_photo = photos[0]
+                    self.right_photo = first_photo
                     self.right_animation_frames = photos
                     self.right_animation_delays = delays
                     self.right_animation_index = 0
 
-                widget.config(image=photos[0])
-                if len(photos) > 1:
-                    if side == "left":
-                        self.left_animation_after_id = self.master.after(
-                            delays[0], lambda: self._advance_animation("left")
-                        )
-                    else:
-                        self.right_animation_after_id = self.master.after(
-                            delays[0], lambda: self._advance_animation("right")
-                        )
+                widget.config(image=first_photo)
+                if len(frame_data) <= 1:
+                    return
+
+                animation_started = False
+
+                def convert_batch(start_idx: int) -> None:
+                    nonlocal animation_started
+                    if load_generation != self._load_generation[side]:
+                        return
+
+                    end_idx = min(start_idx + PHOTOIMAGE_BATCH_SIZE, len(frame_data))
+                    for idx in range(start_idx, end_idx):
+                        frame, delay = frame_data[idx]
+                        photos.append(ImageTk.PhotoImage(frame))
+                        delays.append(delay)
+
+                    if not animation_started and len(photos) > 1:
+                        animation_started = True
+                        if side == "left":
+                            self.left_animation_after_id = self.master.after(
+                                delays[0], lambda: self._advance_animation("left")
+                            )
+                        else:
+                            self.right_animation_after_id = self.master.after(
+                                delays[0], lambda: self._advance_animation("right")
+                            )
+
+                    if end_idx < len(frame_data):
+                        self.master.after(1, lambda: convert_batch(end_idx))
+
+                self.master.after(1, lambda: convert_batch(1))
 
             self.master.after(0, apply_result)
 
