@@ -1,6 +1,6 @@
 # media-glicko2
 
-A Tkinter desktop app for **pairwise image preference ranking** powered by **Glicko-2**.
+A Tkinter desktop app for **pairwise media preference ranking** powered by **Glicko-2**.
 
 Each image is treated like a “player,” each comparison is a “match,” and ratings are updated at the end of each session. The app is designed for iterative curation workflows where you repeatedly compare, rank, prune, and add images over time.
 
@@ -40,22 +40,24 @@ Why prefixing helps:
 - Ratings are visible directly in file explorers
 - The app can parse existing metadata and continue from prior state
 
-## Supported image formats
+## Supported media formats
 
-- `.jpg`, `.jpeg`, `.png`, `.bmp`, `.gif`, `.webp`
+- **Images/GIF**: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.gif`, `.webp`
+- **Video**: `.mp4`, `.mov`, `.mkv`, `.webm`, `.avi`, `.m4v`
 
-> Note: GIFs are currently loaded as still images through Pillow in this app (not full animated playback logic).
+Animated GIFs and videos are played in a loop while you compare a pair.
 
 ## Requirements
 
 - Python 3.10+
 - [Pillow](https://pypi.org/project/Pillow/)
+- [ImageIO](https://pypi.org/project/imageio/) (for video frame decoding)
 - Tkinter (usually included with standard Python installers)
 
 Install dependency:
 
 ```bash
-pip install pillow
+pip install pillow imageio
 ```
 
 ## Run
@@ -115,12 +117,13 @@ Because of this, rankings are relative to the **current pool** and naturally tra
 ## Limitations / notes
 
 - Updates are batch-applied at session end; if you close mid-session, that session’s uncommitted comparisons are not persisted.
-- No dedicated video ranking pipeline yet.
-- GIF animation playback is not implemented as an animation-first viewer.
+- Video playback requires `imageio` and a compatible local decoder stack.
+- Very long media files are sampled to a capped number of frames to keep UI responsive.
 
 ## File overview
 
-- `media-glicko2.py` — main app, Glicko-2 logic, pairing, UI, undo/draw handling, filename persistence.
+- `media-glicko2.py` — main app, Glicko-2 logic, media loading/playback, pairing, UI, undo/draw handling, filename persistence.
+- `tests/test_media_glicko2.py` — unit tests for media loading helpers and supported extension behavior.
 
 ## License
 

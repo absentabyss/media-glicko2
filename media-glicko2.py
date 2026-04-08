@@ -38,9 +38,14 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 try:
-    from PIL import Image, ImageOps, ImageTk
+    from PIL import Image, ImageOps, ImageSequence, ImageTk
 except ImportError:
     raise SystemExit("Pillow is required. Install it with: pip install pillow")
+
+try:
+    import imageio.v3 as iio
+except ImportError:
+    iio = None
 
 
 # =========================
@@ -178,10 +183,12 @@ def update_glicko2_player(player: Glicko2Player, tau: float = 0.5) -> None:
 
 
 # =========================
-# FILE / IMAGE HELPERS
+# FILE / MEDIA HELPERS
 # =========================
 
-SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+SUPPORTED_EXTS = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS
 
 # Example prefix:
 # "[G2_R1500.0_RD200.3_S0.0600] "
@@ -209,6 +216,65 @@ def player_from_path(path: Path) -> Glicko2Player:
 def load_images(folder: Path) -> List[Path]:
     files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
     return sorted(files, key=lambda p: p.name.lower())
+
+
+def _center_on_canvas(img: Image.Image, canvas_size: Tuple[int, int]) -> Image.Image:
+    canvas_w, canvas_h = canvas_size
+    fitted = ImageOps.contain(img, (max(canvas_w - 20, 1), max(canvas_h - 20, 1)))
+    canvas = Image.new("RGB", (canvas_w, canvas_h), color=(21, 21, 21))
+    x = (canvas_w - fitted.width) // 2
+    y = (canvas_h - fitted.height) // 2
+    canvas.paste(fitted, (x, y))
+    return canvas
+
+
+def _load_gif_frames(path: Path, target_size: Tuple[int, int], max_frames: int = 240) -> List[Tuple[Image.Image, int]]:
+    frames: List[Tuple[Image.Image, int]] = []
+    with Image.open(path) as img:
+        for index, frame in enumerate(ImageSequence.Iterator(img)):
+            if index >= max_frames:
+                break
+            duration = int(frame.info.get("duration", img.info.get("duration", 100)) or 100)
+            frame_rgb = frame.convert("RGB")
+            frames.append((_center_on_canvas(frame_rgb, target_size), max(duration, 16)))
+    return frames
+
+
+def _load_video_frames(path: Path, target_size: Tuple[int, int], max_frames: int = 240) -> List[Tuple[Image.Image, int]]:
+    if iio is None:
+        return []
+
+    metadata = iio.immeta(path)
+    fps = float(metadata.get("fps", 24) or 24)
+    frame_delay_ms = max(int(1000 / fps), 16)
+
+    frames: List[Tuple[Image.Image, int]] = []
+    for index, ndarray_frame in enumerate(iio.imiter(path)):
+        if index >= max_frames:
+            break
+        frame_img = Image.fromarray(ndarray_frame).convert("RGB")
+        frames.append((_center_on_canvas(frame_img, target_size), frame_delay_ms))
+    return frames
+
+
+def load_media_frames(path: Path, target_size: Tuple[int, int], max_frames: int = 240) -> List[Tuple[Image.Image, int]]:
+    suffix = path.suffix.lower()
+
+    try:
+        if suffix == ".gif":
+            frames = _load_gif_frames(path, target_size, max_frames=max_frames)
+            if frames:
+                return frames
+        elif suffix in SUPPORTED_VIDEO_EXTS:
+            frames = _load_video_frames(path, target_size, max_frames=max_frames)
+            if frames:
+                return frames
+
+        with Image.open(path) as img:
+            return [(_center_on_canvas(img.convert("RGB"), target_size), 100)]
+    except Exception:
+        fallback = Image.new("RGB", target_size, color=(30, 30, 30))
+        return [(fallback, 100)]
 
 
 def build_random_pairs_once(paths: List[Path]) -> List[Tuple[Path, Path]]:
@@ -250,6 +316,14 @@ class ImageRankerApp:
 
         self.left_photo = None
         self.right_photo = None
+        self.left_animation_after_id = None
+        self.right_animation_after_id = None
+        self.left_animation_frames: List[ImageTk.PhotoImage] = []
+        self.right_animation_frames: List[ImageTk.PhotoImage] = []
+        self.left_animation_delays: List[int] = []
+        self.right_animation_delays: List[int] = []
+        self.left_animation_index = 0
+        self.right_animation_index = 0
         self._resize_after_id = None
         self._last_root_size = (self.master.winfo_width(), self.master.winfo_height())
 
@@ -412,30 +486,76 @@ class ImageRankerApp:
         self.left_label.config(wraplength=panel_width, text=f"Left: {shorten_name(left_path.name, 80)}")
         self.right_label.config(wraplength=panel_width, text=f"Right: {shorten_name(right_path.name, 80)}")
 
-        self.left_photo = self._load_display_image(left_path, self.left_image_label)
-        self.right_photo = self._load_display_image(right_path, self.right_image_label)
-
-        self.left_image_label.config(image=self.left_photo)
-        self.right_image_label.config(image=self.right_photo)
+        self._set_media_on_label(left_path, self.left_image_label, side="left")
+        self._set_media_on_label(right_path, self.right_image_label, side="right")
 
         self._update_progress()
 
-    def _load_display_image(self, path: Path, widget: tk.Label) -> ImageTk.PhotoImage:
+    def _stop_animation(self, side: str) -> None:
+        if side == "left":
+            if self.left_animation_after_id is not None:
+                self.master.after_cancel(self.left_animation_after_id)
+                self.left_animation_after_id = None
+            self.left_animation_frames = []
+            self.left_animation_delays = []
+            self.left_animation_index = 0
+        else:
+            if self.right_animation_after_id is not None:
+                self.master.after_cancel(self.right_animation_after_id)
+                self.right_animation_after_id = None
+            self.right_animation_frames = []
+            self.right_animation_delays = []
+            self.right_animation_index = 0
+
+    def _advance_animation(self, side: str) -> None:
+        if side == "left":
+            frames = self.left_animation_frames
+            delays = self.left_animation_delays
+            if not frames:
+                return
+            self.left_animation_index = (self.left_animation_index + 1) % len(frames)
+            self.left_image_label.config(image=frames[self.left_animation_index])
+            delay = delays[self.left_animation_index]
+            self.left_animation_after_id = self.master.after(delay, lambda: self._advance_animation("left"))
+        else:
+            frames = self.right_animation_frames
+            delays = self.right_animation_delays
+            if not frames:
+                return
+            self.right_animation_index = (self.right_animation_index + 1) % len(frames)
+            self.right_image_label.config(image=frames[self.right_animation_index])
+            delay = delays[self.right_animation_index]
+            self.right_animation_after_id = self.master.after(delay, lambda: self._advance_animation("right"))
+
+    def _set_media_on_label(self, path: Path, widget: tk.Label, side: str) -> None:
         widget.update_idletasks()
         w = max(widget.winfo_width(), 200)
         h = max(widget.winfo_height(), 200)
+        self._stop_animation(side)
 
-        try:
-            img = Image.open(path).convert("RGB")
-        except Exception:
-            img = Image.new("RGB", (800, 600), color=(30, 30, 30))
+        frame_data = load_media_frames(path, (w, h))
+        photos = [ImageTk.PhotoImage(frame) for frame, _ in frame_data]
+        delays = [delay for _, delay in frame_data]
 
-        fitted = ImageOps.contain(img, (max(w - 20, 1), max(h - 20, 1)))
-        canvas = Image.new("RGB", (w, h), color=(21, 21, 21))
-        x = (w - fitted.width) // 2
-        y = (h - fitted.height) // 2
-        canvas.paste(fitted, (x, y))
-        return ImageTk.PhotoImage(canvas)
+        if side == "left":
+            self.left_photo = photos[0]
+            self.left_animation_frames = photos
+            self.left_animation_delays = delays
+            self.left_animation_index = 0
+        else:
+            self.right_photo = photos[0]
+            self.right_animation_frames = photos
+            self.right_animation_delays = delays
+            self.right_animation_index = 0
+
+        widget.config(image=photos[0])
+        if len(photos) > 1:
+            if side == "left":
+                self.left_animation_after_id = self.master.after(delays[0], lambda: self._advance_animation("left"))
+            else:
+                self.right_animation_after_id = self.master.after(
+                    delays[0], lambda: self._advance_animation("right")
+                )
 
     def pick_winner(self, side: str) -> None:
         if not self.pairs or self.current_index >= len(self.pairs):
@@ -499,6 +619,8 @@ class ImageRankerApp:
     def finish_session(self) -> None:
         if not self.image_paths:
             return
+        self._stop_animation("left")
+        self._stop_animation("right")
 
         for path in self.image_paths:
             update_glicko2_player(self.players[path], tau=0.5)
