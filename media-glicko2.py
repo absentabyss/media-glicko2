@@ -27,6 +27,8 @@ Supported formats:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import random
 import re
@@ -194,6 +196,12 @@ SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
 SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 SUPPORTED_EXTS = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS
 VIDEO_FRAME_CACHE: Dict[Tuple[Path, Tuple[int, int], int], List[Tuple[Image.Image, int]]] = {}
+VIDEO_SOURCE_FRAME_CACHE: Dict[Tuple[Path, str], List[Tuple[Image.Image, int]]] = {}
+VIDEO_CACHE_DIR_NAME = ".g2cache"
+VIDEO_CACHE_VERSION = 1
+VIDEO_COMPILE_SIZE = (1200, 1200)
+VIDEO_CACHE_MAX_FRAMES = 90
+VIDEO_CACHE_TARGET_FPS = 14.0
 
 # Example prefix:
 # "[G2_R1500.0_RD200.3_S0.0600] "
@@ -219,7 +227,11 @@ def player_from_path(path: Path) -> Glicko2Player:
 
 
 def load_images(folder: Path) -> List[Path]:
-    files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    files = [
+        p
+        for p in folder.iterdir()
+        if p.name != VIDEO_CACHE_DIR_NAME and p.is_file() and p.suffix.lower() in SUPPORTED_EXTS
+    ]
     return sorted(files, key=lambda p: p.name.lower())
 
 
@@ -245,20 +257,35 @@ def _load_gif_frames(path: Path, target_size: Tuple[int, int], max_frames: int =
     return frames
 
 
-def _load_video_frames(path: Path, target_size: Tuple[int, int], max_frames: int = 240) -> List[Tuple[Image.Image, int]]:
+def _load_video_frames(
+    path: Path, target_size: Tuple[int, int], max_frames: int = 240, target_fps: float | None = None
+) -> List[Tuple[Image.Image, int]]:
     plugin_candidates = ["pyav", "ffmpeg", None]
     frame_delay_ms = 41  # ~24 fps fallback; avoids an expensive metadata pass for every load.
 
     if iio is not None:
         for plugin in plugin_candidates:
             kwargs = {} if plugin is None else {"plugin": plugin}
+            source_fps = 24.0
+            frame_step = 1
+            if target_fps and target_fps > 0:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        meta = iio.immeta(path, **kwargs) or {}
+                        source_fps = float(meta.get("fps", 24.0) or 24.0)
+                except Exception:
+                    source_fps = 24.0
+                frame_step = max(int(round(source_fps / target_fps)), 1)
 
             frames: List[Tuple[Image.Image, int]] = []
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     for index, ndarray_frame in enumerate(iio.imiter(path, **kwargs)):
-                        if index >= max_frames:
+                        if frame_step > 1 and index % frame_step != 0:
+                            continue
+                        if len(frames) >= max_frames:
                             break
                         frame_img = Image.fromarray(ndarray_frame).convert("RGB")
                         frames.append((_center_on_canvas(frame_img, target_size), frame_delay_ms))
@@ -283,11 +310,19 @@ def _load_video_frames(path: Path, target_size: Tuple[int, int], max_frames: int
         fps = float(meta.get("fps", 24) or 24)
         if fps <= 0:
             fps = 24.0
-        frame_delay_ms = max(int(1000 / fps), 16)
+        if target_fps and target_fps > 0:
+            frame_step = max(int(round(fps / target_fps)), 1)
+            effective_fps = max(fps / frame_step, 1.0)
+        else:
+            frame_step = 1
+            effective_fps = fps
+        frame_delay_ms = max(int(1000 / effective_fps), 16)
 
         frames: List[Tuple[Image.Image, int]] = []
         for index, ndarray_frame in enumerate(reader):
-            if index >= max_frames:
+            if frame_step > 1 and index % frame_step != 0:
+                continue
+            if len(frames) >= max_frames:
                 break
             frame_img = Image.fromarray(ndarray_frame).convert("RGB")
             frames.append((_center_on_canvas(frame_img, target_size), frame_delay_ms))
@@ -299,6 +334,137 @@ def _load_video_frames(path: Path, target_size: Tuple[int, int], max_frames: int
             reader.close()
         except Exception:
             pass
+
+
+def _video_compile_settings(compile_size: Tuple[int, int] = VIDEO_COMPILE_SIZE) -> Dict[str, object]:
+    return {
+        "cache_version": VIDEO_CACHE_VERSION,
+        "compile_size": [compile_size[0], compile_size[1]],
+        "max_frames": VIDEO_CACHE_MAX_FRAMES,
+        "target_fps": VIDEO_CACHE_TARGET_FPS,
+    }
+
+
+def _compute_video_cache_key(path: Path, compile_size: Tuple[int, int] = VIDEO_COMPILE_SIZE) -> str:
+    stat = path.stat()
+    payload = {
+        "source_filename": path.name,
+        "source_size": stat.st_size,
+        "source_mtime_ns": stat.st_mtime_ns,
+        "settings": _video_compile_settings(compile_size),
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
+def _video_cache_dir(path: Path, compile_size: Tuple[int, int] = VIDEO_COMPILE_SIZE) -> Path:
+    key = _compute_video_cache_key(path, compile_size=compile_size)
+    cache_root = path.parent / VIDEO_CACHE_DIR_NAME
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]", "_", path.stem)[:80] or "video"
+    return cache_root / f"{safe_stem}_{key}"
+
+
+def _video_cache_meta_path(path: Path, compile_size: Tuple[int, int] = VIDEO_COMPILE_SIZE) -> Path:
+    return _video_cache_dir(path, compile_size=compile_size) / "meta.json"
+
+
+def _has_valid_video_cache(path: Path, compile_size: Tuple[int, int] = VIDEO_COMPILE_SIZE) -> bool:
+    meta_path = _video_cache_meta_path(path, compile_size=compile_size)
+    if not meta_path.exists():
+        return False
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+
+    delays = meta.get("frame_delays_ms")
+    if (
+        meta.get("cache_version") != VIDEO_CACHE_VERSION
+        or meta.get("source_filename") != path.name
+        or tuple(meta.get("compile_size", [])) != compile_size
+        or not isinstance(delays, list)
+        or meta.get("frame_count") != len(delays)
+    ):
+        return False
+
+    frame_count = int(meta["frame_count"])
+    if frame_count <= 0:
+        return False
+    cache_dir = meta_path.parent
+    for idx in range(frame_count):
+        if not (cache_dir / f"frame_{idx:04d}.png").exists():
+            return False
+    return True
+
+
+def _compile_video_cache(path: Path, compile_size: Tuple[int, int] = VIDEO_COMPILE_SIZE) -> bool:
+    cache_dir = _video_cache_dir(path, compile_size=compile_size)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    frames = _load_video_frames(
+        path,
+        compile_size,
+        max_frames=VIDEO_CACHE_MAX_FRAMES,
+        target_fps=VIDEO_CACHE_TARGET_FPS,
+    )
+    if not frames:
+        return False
+
+    for old_frame in cache_dir.glob("frame_*.png"):
+        try:
+            old_frame.unlink()
+        except Exception:
+            pass
+
+    delays: List[int] = []
+    for idx, (frame, delay) in enumerate(frames):
+        frame.save(cache_dir / f"frame_{idx:04d}.png", format="PNG")
+        delays.append(max(int(delay), 16))
+
+    meta = {
+        "source_filename": path.name,
+        "frame_count": len(delays),
+        "frame_delays_ms": delays,
+        "compile_size": [compile_size[0], compile_size[1]],
+        "cache_version": VIDEO_CACHE_VERSION,
+        "cache_key": _compute_video_cache_key(path, compile_size=compile_size),
+        "compile_settings": _video_compile_settings(compile_size),
+    }
+    (cache_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    VIDEO_SOURCE_FRAME_CACHE[(path, meta["cache_key"])] = frames
+    return True
+
+
+def _load_video_frames_from_cache(
+    path: Path, target_size: Tuple[int, int], compile_size: Tuple[int, int] = VIDEO_COMPILE_SIZE
+) -> List[Tuple[Image.Image, int]]:
+    meta_path = _video_cache_meta_path(path, compile_size=compile_size)
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    cache_key = meta.get("cache_key")
+    delays_raw = meta.get("frame_delays_ms", [])
+    if not cache_key or not isinstance(delays_raw, list):
+        return []
+    delays = [max(int(d), 16) for d in delays_raw]
+    source_key = (path, cache_key)
+
+    source_frames = VIDEO_SOURCE_FRAME_CACHE.get(source_key)
+    if source_frames is None:
+        source_frames = []
+        frame_count = int(meta.get("frame_count", 0) or 0)
+        cache_dir = meta_path.parent
+        for idx in range(frame_count):
+            frame_path = cache_dir / f"frame_{idx:04d}.png"
+            try:
+                with Image.open(frame_path) as img:
+                    source_frames.append((img.convert("RGB").copy(), delays[idx]))
+            except Exception:
+                return []
+        VIDEO_SOURCE_FRAME_CACHE[source_key] = source_frames
+
+    return [(_center_on_canvas(frame, target_size), delay) for frame, delay in source_frames]
 
 
 def load_media_frames(path: Path, target_size: Tuple[int, int], max_frames: int = 240) -> List[Tuple[Image.Image, int]]:
@@ -315,8 +481,20 @@ def load_media_frames(path: Path, target_size: Tuple[int, int], max_frames: int 
                 VIDEO_FRAME_CACHE[cache_key] = frames
                 return frames
         elif suffix in SUPPORTED_VIDEO_EXTS:
-            # WebM decode startup can be slow depending on GOP layout + backend.
-            # Keep decode work bounded for interactive responsiveness.
+            if _has_valid_video_cache(path):
+                frames = _load_video_frames_from_cache(path, target_size)
+                if frames:
+                    VIDEO_FRAME_CACHE[cache_key] = frames
+                    return frames
+
+            compiled_ok = _compile_video_cache(path)
+            if compiled_ok and _has_valid_video_cache(path):
+                frames = _load_video_frames_from_cache(path, target_size)
+                if frames:
+                    VIDEO_FRAME_CACHE[cache_key] = frames
+                    return frames
+
+            # Last-resort fallback: direct decode from source.
             video_max_frames = 72 if suffix == ".webm" else max_frames
             frames = _load_video_frames(path, target_size, max_frames=video_max_frames)
             if frames:
@@ -492,6 +670,8 @@ class ImageRankerApp:
             return
 
         self.folder = folder
+        VIDEO_FRAME_CACHE.clear()
+        VIDEO_SOURCE_FRAME_CACHE.clear()
         self.image_paths = image_paths
         self.players = {p: player_from_path(p) for p in image_paths}
         self.pairs = self.build_session_pairs(image_paths)
@@ -499,8 +679,30 @@ class ImageRankerApp:
         self.history = []
 
         self.status_var.set(f"Loaded {len(self.image_paths)} images from: {self.folder}")
+        self.compile_folder_videos()
         self._update_progress()
         self.show_current_pair()
+
+    def compile_folder_videos(self) -> None:
+        if not self.folder:
+            return
+        video_paths = [p for p in self.image_paths if p.suffix.lower() in SUPPORTED_VIDEO_EXTS]
+        if not video_paths:
+            return
+
+        cache_root = self.folder / VIDEO_CACHE_DIR_NAME
+        cache_root.mkdir(parents=True, exist_ok=True)
+
+        total = len(video_paths)
+        for idx, video_path in enumerate(video_paths, start=1):
+            self.status_var.set(f"Compiling video {idx}/{total}: {video_path.name}")
+            self.master.update_idletasks()
+            try:
+                if not _has_valid_video_cache(video_path):
+                    _compile_video_cache(video_path)
+            except Exception:
+                # Keep startup resilient; display-time fallback still exists.
+                continue
 
     def _update_progress(self) -> None:
         total_pairs = len(self.pairs)
