@@ -4,17 +4,30 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from PIL import Image
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ModuleNotFoundError:
+    Image = None
+    PIL_AVAILABLE = False
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "media-glicko2.py"
-spec = importlib.util.spec_from_file_location("media_glicko2", MODULE_PATH)
-media_glicko2 = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-sys.modules[spec.name] = media_glicko2
-spec.loader.exec_module(media_glicko2)
+MEDIA_MODULE_AVAILABLE = False
+media_glicko2 = None
+if PIL_AVAILABLE:
+    spec = importlib.util.spec_from_file_location("media_glicko2", MODULE_PATH)
+    media_glicko2 = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = media_glicko2
+    try:
+        spec.loader.exec_module(media_glicko2)
+        MEDIA_MODULE_AVAILABLE = True
+    except SystemExit:
+        MEDIA_MODULE_AVAILABLE = False
 
 
+@unittest.skipUnless(PIL_AVAILABLE and MEDIA_MODULE_AVAILABLE, "Pillow is required for media-glicko2 tests")
 class MediaHelpersTests(unittest.TestCase):
     def test_supported_extensions_include_videos(self):
         self.assertIn(".gif", media_glicko2.SUPPORTED_EXTS)

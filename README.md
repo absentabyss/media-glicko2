@@ -54,10 +54,10 @@ Animated GIFs and videos are played in a loop while you compare a pair.
 - [ImageIO](https://pypi.org/project/imageio/) (for video frame decoding)
 - Tkinter (usually included with standard Python installers)
 
-Install dependency:
+Install dependencies:
 
 ```bash
-pip install pillow imageio
+pip install -r requirements.txt
 ```
 
 ## Run
