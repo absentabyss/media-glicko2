@@ -1251,45 +1251,28 @@ class ImageRankerApp:
         )
 
     def _ensure_vlc_player(self, side: str):
-        """Create a fresh VLC player for the given side.
+        """Return the persistent VLC player for a side, creating it on first use.
 
-        A new player is created on every call so that the previous player can be
-        stopped safely in a background thread without racing against a new play()
-        call on the same object.  The old player's set_hwnd(0) + stop() are
-        offloaded to a daemon thread so the main thread never blocks.
+        The same player object is reused across all transitions.  Transitions are
+        done with set_media()+play() which are non-blocking — stop() is never
+        called on the main thread, only from background threads at cleanup time.
         """
         if not self._vlc_instance:
             return None
-
-        old_player = self._vlc_player_for_side(side)
-        if old_player is not None:
-            def _stop_old(p=old_player, s=side) -> None:
-                try:
-                    p.stop()
-                    # Detach AFTER stop — detaching while playing causes VLC to
-                    # open its own floating OS window to replace the lost HWND.
-                    if sys.platform.startswith("win"):
-                        try:
-                            p.set_hwnd(0)
-                        except Exception:
-                            pass
-                    LOGGER.debug("Async old-player stop complete side=%s", s)
-                except Exception:
-                    LOGGER.debug("Async old-player stop error side=%s", s, exc_info=True)
-            threading.Thread(target=_stop_old, name=f"VLCStop-{side}", daemon=True).start()
-
-        player = self._vlc_instance.media_player_new()
-        em = player.event_manager()
-        def _event_log(event_name: str):
-            return lambda _event, s=side, n=event_name: self._log_vlc_event(s, n)
-        # Looping is handled by the :input-repeat media option; no EndReached
-        # callback needed (and no stop() inside _restart_vlc to block on).
-        em.event_attach(vlc.EventType.MediaPlayerEncounteredError, _event_log("EncounteredError"))
-        em.event_attach(vlc.EventType.MediaPlayerOpening, _event_log("Opening"))
-        em.event_attach(vlc.EventType.MediaPlayerBuffering, _event_log("Buffering"))
-        em.event_attach(vlc.EventType.MediaPlayerPlaying, _event_log("Playing"))
-        em.event_attach(vlc.EventType.MediaPlayerPaused, _event_log("Paused"))
-        self._set_vlc_player_for_side(side, player)
+        player = self._vlc_player_for_side(side)
+        if player is None:
+            player = self._vlc_instance.media_player_new()
+            em = player.event_manager()
+            def _event_log(event_name: str):
+                return lambda _event, s=side, n=event_name: self._log_vlc_event(s, n)
+            # Looping is handled by the :input-repeat media option; no EndReached
+            # callback needed (and therefore no stop() on the main thread).
+            em.event_attach(vlc.EventType.MediaPlayerEncounteredError, _event_log("EncounteredError"))
+            em.event_attach(vlc.EventType.MediaPlayerOpening, _event_log("Opening"))
+            em.event_attach(vlc.EventType.MediaPlayerBuffering, _event_log("Buffering"))
+            em.event_attach(vlc.EventType.MediaPlayerPlaying, _event_log("Playing"))
+            em.event_attach(vlc.EventType.MediaPlayerPaused, _event_log("Paused"))
+            self._set_vlc_player_for_side(side, player)
         return player
 
     def _bind_vlc_to_widget(self, player, widget: tk.Widget) -> None:
