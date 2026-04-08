@@ -204,6 +204,46 @@ class MediaHelpersTests(unittest.TestCase):
         self.assertEqual(len(shortened), 20)
         self.assertIn("...", shortened)
 
+    def test_rename_with_retry_retries_after_permission_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "from.txt"
+            dst = Path(tmpdir) / "to.txt"
+            src.write_text("payload", encoding="utf-8")
+            real_rename = Path.rename
+            attempts = {"count": 0}
+
+            def flaky_rename(path_obj, target):
+                if path_obj == src and Path(target) == dst and attempts["count"] == 0:
+                    attempts["count"] += 1
+                    raise PermissionError("[WinError 32] file is in use")
+                return real_rename(path_obj, target)
+
+            with patch.object(Path, "rename", autospec=True, side_effect=flaky_rename), patch.object(
+                media_glicko2.time, "sleep", return_value=None
+            ) as sleep_mock:
+                media_glicko2._rename_with_retry(src, dst)
+
+            self.assertEqual(attempts["count"], 1)
+            self.assertTrue(dst.exists())
+            sleep_mock.assert_called_once()
+
+    def test_rename_with_retry_raises_after_max_attempts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "from.txt"
+            dst = Path(tmpdir) / "to.txt"
+            src.write_text("payload", encoding="utf-8")
+
+            def always_locked(_path_obj, _target):
+                raise PermissionError("still locked")
+
+            with patch.object(Path, "rename", autospec=True, side_effect=always_locked), patch.object(
+                media_glicko2.time, "sleep", return_value=None
+            ) as sleep_mock:
+                with self.assertRaises(PermissionError):
+                    media_glicko2._rename_with_retry(src, dst)
+
+            self.assertEqual(sleep_mock.call_count, media_glicko2.RENAME_RETRY_ATTEMPTS - 1)
+
 
 if __name__ == "__main__":
     unittest.main()
