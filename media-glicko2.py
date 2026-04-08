@@ -192,7 +192,7 @@ SUPPORTED_EXTS = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS
 
 # Example prefix:
 # "[G2_R1500.0_RD200.3_S0.0600] "
-STATS_PREFIX_RE = re.compile(r"^\[G2_R(-?\d+(?:\.\d+)?)_RD(\d+(?:\.\d+)?)_S(\d+(?:\.\d+)?)\]\s+")
+STATS_PREFIX_RE = re.compile(r"^\[G2_R(-?\d+(?:\.\d+)?)_RD(\d+(?:\.\d+)?)_S(\d+(?:\.\d+)?)\]\s*")
 
 
 def strip_existing_prefix(stem: str) -> str:
