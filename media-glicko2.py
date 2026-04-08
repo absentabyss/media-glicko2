@@ -524,20 +524,7 @@ def load_media_frames(path: Path, target_size: Tuple[int, int], max_frames: int 
                 VIDEO_FRAME_CACHE[cache_key] = frames
                 return frames
         elif suffix in SUPPORTED_VIDEO_EXTS:
-            if _has_valid_video_cache(path):
-                frames = _load_video_frames_from_cache(path, target_size)
-                if frames:
-                    VIDEO_FRAME_CACHE[cache_key] = frames
-                    return frames
-
-            compiled_ok = _compile_video_cache(path)
-            if compiled_ok and _has_valid_video_cache(path):
-                frames = _load_video_frames_from_cache(path, target_size)
-                if frames:
-                    VIDEO_FRAME_CACHE[cache_key] = frames
-                    return frames
-
-            # Last-resort fallback: direct decode from source.
+            # Decode directly from source when VLC playback is unavailable.
             video_max_frames = 72 if suffix == ".webm" else max_frames
             frames = _load_video_frames(path, target_size, max_frames=video_max_frames)
             if frames:
@@ -747,31 +734,9 @@ class ImageRankerApp:
         self.history = []
 
         self.status_var.set(f"Loaded {len(self.image_paths)} images from: {self.folder}")
-        self.compile_folder_videos()
         self._update_progress()
         self.show_current_pair()
         self._start_preload_upcoming_videos()
-
-    def compile_folder_videos(self) -> None:
-        if not self.folder:
-            return
-        video_paths = [p for p in self.image_paths if p.suffix.lower() in SUPPORTED_VIDEO_EXTS]
-        if not video_paths:
-            return
-
-        cache_root = self.folder / VIDEO_CACHE_DIR_NAME
-        cache_root.mkdir(parents=True, exist_ok=True)
-
-        total = len(video_paths)
-        for idx, video_path in enumerate(video_paths, start=1):
-            self.status_var.set(f"Compiling video {idx}/{total}: {video_path.name}")
-            self.master.update_idletasks()
-            try:
-                if not _has_valid_video_cache(video_path):
-                    _compile_video_cache(video_path)
-            except Exception:
-                # Keep startup resilient; display-time fallback still exists.
-                continue
 
     def _update_progress(self) -> None:
         total_pairs = len(self.pairs)
@@ -887,22 +852,15 @@ class ImageRankerApp:
     def _preload_video_to_ram(self, path: Path) -> None:
         if path.suffix.lower() not in SUPPORTED_VIDEO_EXTS:
             return
-        cache_key = _compute_video_cache_key(path, compile_size=VIDEO_COMPILE_SIZE)
-        source_key = (path, cache_key)
+        target_size = self._current_preload_target_size()
+        source_key = (path, target_size)
         with self._preload_lock:
             if source_key in VIDEO_SOURCE_FRAME_CACHE:
                 return
 
-        if not _has_valid_video_cache(path):
-            _compile_video_cache(path)
-            if not _has_valid_video_cache(path):
-                return
-
-        # Load compile-sized frames to populate VIDEO_SOURCE_FRAME_CACHE.
-        _load_video_frames_from_cache(path, VIDEO_COMPILE_SIZE)
-        # Warm display-sized cache too so runtime pairing is immediate.
-        target_size = self._current_preload_target_size()
         load_media_frames(path, target_size)
+        with self._preload_lock:
+            VIDEO_SOURCE_FRAME_CACHE[source_key] = []
 
     def _current_preload_target_size(self) -> Tuple[int, int]:
         # Must match the formula in _set_media_on_label exactly so the preloaded
@@ -1170,6 +1128,8 @@ class ImageRankerApp:
             return
         self._stop_animation("left")
         self._stop_animation("right")
+        self._stop_vlc("left")
+        self._stop_vlc("right")
 
         for path in self.image_paths:
             update_glicko2_player(self.players[path], tau=0.5)

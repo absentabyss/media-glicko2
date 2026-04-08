@@ -80,46 +80,16 @@ class MediaHelpersTests(unittest.TestCase):
             self.assertEqual(tuple(meta["compile_size"]), media_glicko2.VIDEO_COMPILE_SIZE)
             self.assertEqual(meta["cache_version"], media_glicko2.VIDEO_CACHE_VERSION)
 
-    def test_load_media_frames_uses_existing_video_cache(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            video_path = Path(tmpdir) / "clip.webm"
-            video_path.write_bytes(b"fake-video")
-            fake_source_frames = [
-                (Image.new("RGB", media_glicko2.VIDEO_COMPILE_SIZE, color=(20, 20, 20)), 50),
-            ]
-
-            with patch.object(media_glicko2, "_load_video_frames", return_value=fake_source_frames):
-                self.assertTrue(media_glicko2._compile_video_cache(video_path))
-
-            target_size = (300, 250)
-            with patch.object(media_glicko2, "_compile_video_cache") as compile_mock, patch.object(
-                media_glicko2, "_load_video_frames"
-            ) as decode_mock:
-                frames = media_glicko2.load_media_frames(video_path, target_size)
-
-            compile_mock.assert_not_called()
-            decode_mock.assert_not_called()
-            self.assertEqual(len(frames), 1)
-            self.assertEqual(frames[0][0].size, target_size)
-
-    def test_load_media_frames_compiles_cache_before_decode_fallback(self):
+    def test_load_media_frames_for_video_decodes_directly(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             video_path = Path(tmpdir) / "clip.webm"
             video_path.write_bytes(b"fake-video")
             expected_frames = [(Image.new("RGB", (220, 180), color=(10, 10, 10)), 60)]
 
-            with patch.object(media_glicko2, "_has_valid_video_cache", side_effect=[False, True]), patch.object(
-                media_glicko2, "_compile_video_cache", return_value=True
-            ) as compile_mock, patch.object(
-                media_glicko2, "_load_video_frames_from_cache", return_value=expected_frames
-            ) as cache_load_mock, patch.object(
-                media_glicko2, "_load_video_frames"
-            ) as decode_mock:
+            with patch.object(media_glicko2, "_load_video_frames", return_value=expected_frames) as decode_mock:
                 frames = media_glicko2.load_media_frames(video_path, (220, 180))
 
-            compile_mock.assert_called_once_with(video_path)
-            cache_load_mock.assert_called_once_with(video_path, (220, 180))
-            decode_mock.assert_not_called()
+            decode_mock.assert_called_once_with(video_path, (220, 180), max_frames=72)
             self.assertEqual(frames, expected_frames)
 
     def test_load_media_frames_for_static_image_returns_one_frame(self):
