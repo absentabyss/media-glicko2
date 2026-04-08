@@ -1251,24 +1251,43 @@ class ImageRankerApp:
         )
 
     def _ensure_vlc_player(self, side: str):
+        """Create a fresh VLC player for the given side.
+
+        A new player is created on every call so that the previous player can be
+        stopped safely in a background thread without racing against a new play()
+        call on the same object.  The old player's set_hwnd(0) + stop() are
+        offloaded to a daemon thread so the main thread never blocks.
+        """
         if not self._vlc_instance:
             return None
-        player = self._vlc_player_for_side(side)
-        if player is None:
-            player = self._vlc_instance.media_player_new()
-            em = player.event_manager()
-            def _event_log(event_name: str):
-                return lambda _event, s=side, n=event_name: self._log_vlc_event(s, n)
-            em.event_attach(
-                vlc.EventType.MediaPlayerEndReached,
-                lambda _event: self.master.after(0, lambda: self._restart_vlc(side)),
-            )
-            em.event_attach(vlc.EventType.MediaPlayerEncounteredError, _event_log("EncounteredError"))
-            em.event_attach(vlc.EventType.MediaPlayerOpening, _event_log("Opening"))
-            em.event_attach(vlc.EventType.MediaPlayerBuffering, _event_log("Buffering"))
-            em.event_attach(vlc.EventType.MediaPlayerPlaying, _event_log("Playing"))
-            em.event_attach(vlc.EventType.MediaPlayerPaused, _event_log("Paused"))
-            self._set_vlc_player_for_side(side, player)
+
+        old_player = self._vlc_player_for_side(side)
+        if old_player is not None:
+            def _stop_old(p=old_player, s=side) -> None:
+                try:
+                    if sys.platform.startswith("win"):
+                        try:
+                            p.set_hwnd(0)
+                        except Exception:
+                            pass
+                    p.stop()
+                    LOGGER.debug("Async old-player stop complete side=%s", s)
+                except Exception:
+                    LOGGER.debug("Async old-player stop error side=%s", s, exc_info=True)
+            threading.Thread(target=_stop_old, name=f"VLCStop-{side}", daemon=True).start()
+
+        player = self._vlc_instance.media_player_new()
+        em = player.event_manager()
+        def _event_log(event_name: str):
+            return lambda _event, s=side, n=event_name: self._log_vlc_event(s, n)
+        # Looping is handled by the :input-repeat media option; no EndReached
+        # callback needed (and no stop() inside _restart_vlc to block on).
+        em.event_attach(vlc.EventType.MediaPlayerEncounteredError, _event_log("EncounteredError"))
+        em.event_attach(vlc.EventType.MediaPlayerOpening, _event_log("Opening"))
+        em.event_attach(vlc.EventType.MediaPlayerBuffering, _event_log("Buffering"))
+        em.event_attach(vlc.EventType.MediaPlayerPlaying, _event_log("Playing"))
+        em.event_attach(vlc.EventType.MediaPlayerPaused, _event_log("Paused"))
+        self._set_vlc_player_for_side(side, player)
         return player
 
     def _bind_vlc_to_widget(self, player, widget: tk.Widget) -> None:
@@ -1293,37 +1312,31 @@ class ImageRankerApp:
                 lambda: player.set_xwindow(handle),
             )
 
-    def _restart_vlc(self, side: str) -> None:
-        player = self._vlc_player_for_side(side)
-        if player is None:
-            return
-        if player.get_media() is None:
-            return
-        LOGGER.debug("Restarting VLC loop on side=%s", side)
-        player.stop()
-        player.play()
-
     def _stop_vlc(self, side: str) -> None:
+        """Asynchronously stop the VLC player for a side.
+
+        player.stop() maps to libvlc_media_player_stop() which blocks the
+        calling thread on Windows until the decoder drains.  Moving it off the
+        main thread prevents UI freezes during pair transitions.
+        """
         self._invalidate_vlc_play_probes(side)
         player = self._vlc_player_for_side(side)
-        if player is not None:
-            self._set_ui_phase("stop-vlc", side=side, media=self._vlc_media_mrl[side])
-            LOGGER.debug("Stopping VLC on side=%s media=%s", side, self._vlc_media_mrl[side])
-            stop_started = time.perf_counter()
-            self._run_mainthread_call_with_watchdog(
-                f"vlc.stop side={side}",
-                player.stop,
-            )
-            LOGGER.debug("VLC stop side=%s elapsed=%.3fs", side, time.perf_counter() - stop_started)
-            try:
-                self._run_mainthread_call_with_watchdog(
-                    f"vlc.set_media_none side={side}",
-                    lambda: player.set_media(None),
-                )
-                LOGGER.debug("VLC set_media(None) succeeded on side=%s", side)
-            except Exception:
-                LOGGER.debug("VLC set_media(None) failed on side=%s", side, exc_info=True)
+        self._set_vlc_player_for_side(side, None)
         self._set_vlc_media_for_side(side, None)
+        if player is not None:
+            LOGGER.debug("Queueing async VLC stop side=%s", side)
+            def _do_stop(p=player, s=side) -> None:
+                try:
+                    if sys.platform.startswith("win"):
+                        try:
+                            p.set_hwnd(0)
+                        except Exception:
+                            pass
+                    p.stop()
+                    LOGGER.debug("Async VLC stop complete side=%s", s)
+                except Exception:
+                    LOGGER.debug("Async VLC stop error side=%s", s, exc_info=True)
+            threading.Thread(target=_do_stop, name=f"VLCStop-{side}", daemon=True).start()
 
     def _play_video_on_frame(self, path: Path, side: str, load_generation: int) -> bool:
         if not self._vlc_enabled or self._vlc_instance is None:
@@ -1340,6 +1353,7 @@ class ImageRankerApp:
         self._bind_vlc_to_widget(player, media_frame)
         media = self._vlc_instance.media_new_path(os.fspath(path))
         media.add_option(":no-audio")
+        media.add_option(":input-repeat=65535")  # loop natively — no Python stop()/play() needed
         self._run_mainthread_call_with_watchdog(
             f"vlc.set_media side={side} file={path.name}",
             lambda: player.set_media(media),
@@ -1391,7 +1405,11 @@ class ImageRankerApp:
         target_size = _bucket_size((w, h))
         LOGGER.debug("Setting media side=%s file=%s widget=%sx%s target=%s", side, path.name, w, h, target_size)
         self._stop_animation(side)
-        self._stop_vlc(side)
+        # Do NOT call _stop_vlc here — that would block the main thread on
+        # libvlc_media_player_stop().  For video→video transitions, the old
+        # player is stopped asynchronously inside _ensure_vlc_player (called
+        # from _play_video_on_frame).  For video→image transitions, _stop_vlc
+        # is called below after the image branch is taken (it is async).
         self._load_generation[side] += 1
         load_generation = self._load_generation[side]
         self._set_ui_phase(
@@ -1413,6 +1431,10 @@ class ImageRankerApp:
 
         if path.suffix.lower() in SUPPORTED_VIDEO_EXTS and self._play_video_on_frame(path, side, load_generation):
             return
+
+        # Image / GIF path — stop any VLC player that was running on this side.
+        # _stop_vlc is now async so this returns immediately.
+        self._stop_vlc(side)
 
         def worker() -> None:
             started = time.perf_counter()
