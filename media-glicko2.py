@@ -825,13 +825,10 @@ class ImageRankerApp:
         load_media_frames(path, target_size)
 
     def _current_preload_target_size(self) -> Tuple[int, int]:
-        left_w = self.left_image_label.winfo_width()
-        right_w = self.right_image_label.winfo_width()
-        left_h = self.left_image_label.winfo_height()
-        right_h = self.right_image_label.winfo_height()
-
-        w = max(left_w, right_w, self.main_frame.winfo_width() // 2 - 20, 200)
-        h = max(left_h, right_h, self.main_frame.winfo_height() - 20, 200)
+        # Must match the formula in _set_media_on_label exactly so the preloaded
+        # frames land in the same VIDEO_FRAME_CACHE bucket that display looks up.
+        w = max(self.left_image_label.winfo_width(), 200)
+        h = max(self.left_image_label.winfo_height(), 200)
         return _bucket_size((w, h))
 
     def _stop_animation(self, side: str) -> None:
