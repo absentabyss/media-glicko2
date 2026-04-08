@@ -30,6 +30,7 @@ from __future__ import annotations
 import math
 import random
 import re
+import threading
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -192,6 +193,7 @@ def update_glicko2_player(player: Glicko2Player, tau: float = 0.5) -> None:
 SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
 SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 SUPPORTED_EXTS = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS
+VIDEO_FRAME_CACHE: Dict[Tuple[Path, Tuple[int, int], int], List[Tuple[Image.Image, int]]] = {}
 
 # Example prefix:
 # "[G2_R1500.0_RD200.3_S0.0600] "
@@ -244,24 +246,12 @@ def _load_gif_frames(path: Path, target_size: Tuple[int, int], max_frames: int =
 
 
 def _load_video_frames(path: Path, target_size: Tuple[int, int], max_frames: int = 240) -> List[Tuple[Image.Image, int]]:
-    plugin_candidates = [None, "pyav", "ffmpeg"]
+    plugin_candidates = ["pyav", "ffmpeg", None]
+    frame_delay_ms = 41  # ~24 fps fallback; avoids an expensive metadata pass for every load.
 
     if iio is not None:
         for plugin in plugin_candidates:
             kwargs = {} if plugin is None else {"plugin": plugin}
-
-            fps = 24.0
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    metadata = iio.immeta(path, **kwargs)
-                fps = float(metadata.get("fps", 24) or 24)
-            except Exception:
-                fps = 24.0
-
-            if fps <= 0:
-                fps = 24.0
-            frame_delay_ms = max(int(1000 / fps), 16)
 
             frames: List[Tuple[Image.Image, int]] = []
             try:
@@ -313,22 +303,35 @@ def _load_video_frames(path: Path, target_size: Tuple[int, int], max_frames: int
 
 def load_media_frames(path: Path, target_size: Tuple[int, int], max_frames: int = 240) -> List[Tuple[Image.Image, int]]:
     suffix = path.suffix.lower()
+    cache_key = (path, target_size, max_frames)
+    cached = VIDEO_FRAME_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     try:
         if suffix == ".gif":
             frames = _load_gif_frames(path, target_size, max_frames=max_frames)
             if frames:
+                VIDEO_FRAME_CACHE[cache_key] = frames
                 return frames
         elif suffix in SUPPORTED_VIDEO_EXTS:
-            frames = _load_video_frames(path, target_size, max_frames=max_frames)
+            # WebM decode startup can be slow depending on GOP layout + backend.
+            # Keep decode work bounded for interactive responsiveness.
+            video_max_frames = 72 if suffix == ".webm" else max_frames
+            frames = _load_video_frames(path, target_size, max_frames=video_max_frames)
             if frames:
+                VIDEO_FRAME_CACHE[cache_key] = frames
                 return frames
 
         with Image.open(path) as img:
-            return [(_center_on_canvas(img.convert("RGB"), target_size), 100)]
+            fallback_frames = [(_center_on_canvas(img.convert("RGB"), target_size), 100)]
+            VIDEO_FRAME_CACHE[cache_key] = fallback_frames
+            return fallback_frames
     except Exception:
         fallback = Image.new("RGB", target_size, color=(30, 30, 30))
-        return [(fallback, 100)]
+        fallback_frames = [(fallback, 100)]
+        VIDEO_FRAME_CACHE[cache_key] = fallback_frames
+        return fallback_frames
 
 
 def build_random_pairs_once(paths: List[Path]) -> List[Tuple[Path, Path]]:
@@ -380,6 +383,7 @@ class ImageRankerApp:
         self.right_animation_index = 0
         self._resize_after_id = None
         self._last_root_size = (self.master.winfo_width(), self.master.winfo_height())
+        self._load_generation = 0
 
         self.top_bar = tk.Frame(self.master, bg="#202020")
         self.top_bar.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
@@ -586,30 +590,54 @@ class ImageRankerApp:
         w = max(widget.winfo_width(), 200)
         h = max(widget.winfo_height(), 200)
         self._stop_animation(side)
+        self._load_generation += 1
+        load_generation = self._load_generation
 
-        frame_data = load_media_frames(path, (w, h))
-        photos = [ImageTk.PhotoImage(frame) for frame, _ in frame_data]
-        delays = [delay for _, delay in frame_data]
-
+        placeholder = Image.new("RGB", (w, h), color=(24, 24, 24))
+        placeholder_photo = ImageTk.PhotoImage(placeholder)
+        widget.config(image=placeholder_photo)
         if side == "left":
-            self.left_photo = photos[0]
-            self.left_animation_frames = photos
-            self.left_animation_delays = delays
-            self.left_animation_index = 0
+            self.left_photo = placeholder_photo
         else:
-            self.right_photo = photos[0]
-            self.right_animation_frames = photos
-            self.right_animation_delays = delays
-            self.right_animation_index = 0
+            self.right_photo = placeholder_photo
 
-        widget.config(image=photos[0])
-        if len(photos) > 1:
-            if side == "left":
-                self.left_animation_after_id = self.master.after(delays[0], lambda: self._advance_animation("left"))
-            else:
-                self.right_animation_after_id = self.master.after(
-                    delays[0], lambda: self._advance_animation("right")
-                )
+        def worker() -> None:
+            frame_data = load_media_frames(path, (w, h))
+
+            def apply_result() -> None:
+                if load_generation != self._load_generation:
+                    return
+
+                photos = [ImageTk.PhotoImage(frame) for frame, _ in frame_data]
+                delays = [delay for _, delay in frame_data]
+                if not photos:
+                    return
+
+                if side == "left":
+                    self.left_photo = photos[0]
+                    self.left_animation_frames = photos
+                    self.left_animation_delays = delays
+                    self.left_animation_index = 0
+                else:
+                    self.right_photo = photos[0]
+                    self.right_animation_frames = photos
+                    self.right_animation_delays = delays
+                    self.right_animation_index = 0
+
+                widget.config(image=photos[0])
+                if len(photos) > 1:
+                    if side == "left":
+                        self.left_animation_after_id = self.master.after(
+                            delays[0], lambda: self._advance_animation("left")
+                        )
+                    else:
+                        self.right_animation_after_id = self.master.after(
+                            delays[0], lambda: self._advance_animation("right")
+                        )
+
+            self.master.after(0, apply_result)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def pick_winner(self, side: str) -> None:
         if not self.pairs or self.current_index >= len(self.pairs):
