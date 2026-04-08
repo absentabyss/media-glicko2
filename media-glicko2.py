@@ -31,6 +31,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import logging
 import math
 import os
 import random
@@ -39,6 +40,7 @@ import sys
 import threading
 import time
 import warnings
+import argparse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -64,6 +66,16 @@ VLC_INSTANCE_OPTIONS = (
     "--no-audio",
     "--aout=dummy",
 )
+LOGGER = logging.getLogger("media_glicko2")
+
+
+def configure_logging(debug: bool = False) -> None:
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
+    )
+    LOGGER.debug("Debug logging enabled.")
 
 
 # =========================
@@ -527,33 +539,48 @@ def load_media_frames(path: Path, target_size: Tuple[int, int], max_frames: int 
     cache_key = (path, target_size, max_frames)
     cached = VIDEO_FRAME_CACHE.get(cache_key)
     if cached is not None:
+        LOGGER.debug("Frame cache hit for %s key=%s", path.name, cache_key)
         return cached
 
+    started_at = time.perf_counter()
     # Deduplication: if another thread is already loading the same key, wait for
     # it to finish instead of duplicating the work.  This lets the display thread
     # "inherit" an in-progress preload rather than restarting from scratch.
     with _FRAME_LOAD_EVENTS_LOCK:
         cached = VIDEO_FRAME_CACHE.get(cache_key)
         if cached is not None:
+            LOGGER.debug("Frame cache hit during lock acquisition for %s", path.name)
             return cached
         existing = _FRAME_LOAD_EVENTS.get(cache_key)
         if existing is not None:
             wait_event = existing
             is_owner = False
+            LOGGER.debug("Waiting for in-progress frame load for %s key=%s", path.name, cache_key)
         else:
             wait_event = threading.Event()
             _FRAME_LOAD_EVENTS[cache_key] = wait_event
             is_owner = True
+            LOGGER.debug("Taking ownership of frame load for %s key=%s", path.name, cache_key)
 
     if not is_owner:
         wait_event.wait(timeout=30)
-        return VIDEO_FRAME_CACHE.get(cache_key) or []
+        waited = time.perf_counter() - started_at
+        loaded = VIDEO_FRAME_CACHE.get(cache_key) or []
+        LOGGER.debug(
+            "Finished waiting for frame load: %s (%.3fs, frames=%d)",
+            path.name,
+            waited,
+            len(loaded),
+        )
+        return loaded
 
     try:
+        LOGGER.debug("Begin decode for %s suffix=%s target=%s", path.name, suffix, target_size)
         if suffix == ".gif":
             frames = _load_gif_frames(path, target_size, max_frames=max_frames)
             if frames:
                 VIDEO_FRAME_CACHE[cache_key] = frames
+                LOGGER.debug("Decoded GIF frames for %s frame_count=%d", path.name, len(frames))
                 return frames
         elif suffix in SUPPORTED_VIDEO_EXTS:
             # Decode directly from source when VLC playback is unavailable.
@@ -561,21 +588,25 @@ def load_media_frames(path: Path, target_size: Tuple[int, int], max_frames: int 
             frames = _load_video_frames(path, target_size, max_frames=video_max_frames)
             if frames:
                 VIDEO_FRAME_CACHE[cache_key] = frames
+                LOGGER.debug("Decoded video frames for %s frame_count=%d", path.name, len(frames))
                 return frames
 
         with Image.open(path) as img:
             fallback_frames = [(_center_on_canvas(img.convert("RGB"), target_size), 100)]
             VIDEO_FRAME_CACHE[cache_key] = fallback_frames
+            LOGGER.debug("Using still-image fallback for %s", path.name)
             return fallback_frames
     except Exception:
         fallback = Image.new("RGB", target_size, color=(30, 30, 30))
         fallback_frames = [(fallback, 100)]
         VIDEO_FRAME_CACHE[cache_key] = fallback_frames
+        LOGGER.debug("Frame decode failed for %s. Using blank fallback frame.", path, exc_info=True)
         return fallback_frames
     finally:
         with _FRAME_LOAD_EVENTS_LOCK:
             _FRAME_LOAD_EVENTS.pop(cache_key, None)
         wait_event.set()
+        LOGGER.debug("Frame load finalized for %s in %.3fs", path.name, time.perf_counter() - started_at)
 
 
 def build_random_pairs_once(paths: List[Path]) -> List[Tuple[Path, Path]]:
@@ -827,6 +858,14 @@ class ImageRankerApp:
             return
 
         left_path, right_path = self.pairs[self.current_index]
+        LOGGER.debug(
+            "Showing pair index=%d/%d redraw_only=%s left=%s right=%s",
+            self.current_index + 1,
+            len(self.pairs),
+            redraw_only,
+            left_path.name,
+            right_path.name,
+        )
 
         panel_width = max(self.main_frame.winfo_width() // 2 - 40, 250)
         self.left_label.config(wraplength=panel_width, text=f"Left: {shorten_name(left_path.name, 80)}")
@@ -882,13 +921,21 @@ class ImageRankerApp:
 
         if not upcoming:
             return
+        LOGGER.debug(
+            "Queueing preload generation=%d lookahead=%d upcoming_pairs=%d",
+            generation,
+            lookahead,
+            len(upcoming),
+        )
 
         def worker() -> None:
             for pair_videos in upcoming:
                 if generation != self._preload_generation:
+                    LOGGER.debug("Cancelling stale preload generation=%d", generation)
                     return
                 # Preload both sides of the pair in parallel so the pair is
                 # ready in max(left_time, right_time) instead of their sum.
+                LOGGER.debug("Preloading pair videos generation=%d files=%s", generation, [p.name for p in pair_videos])
                 threads = [
                     threading.Thread(target=self._preload_video_to_ram, args=(p,), daemon=True)
                     for p in pair_videos
@@ -907,11 +954,15 @@ class ImageRankerApp:
         source_key = (path, target_size)
         with self._preload_lock:
             if source_key in VIDEO_SOURCE_FRAME_CACHE:
+                LOGGER.debug("Skipping preload for %s (already in source cache)", path.name)
                 return
 
+        start = time.perf_counter()
+        LOGGER.debug("Starting preload for %s target=%s", path.name, target_size)
         load_media_frames(path, target_size)
         with self._preload_lock:
             VIDEO_SOURCE_FRAME_CACHE[source_key] = []
+        LOGGER.debug("Finished preload for %s in %.3fs", path.name, time.perf_counter() - start)
 
     def _current_preload_target_size(self) -> Tuple[int, int]:
         # Must match the formula in _set_media_on_label exactly so the preloaded
@@ -984,12 +1035,14 @@ class ImageRankerApp:
             return
         if player.get_media() is None:
             return
+        LOGGER.debug("Restarting VLC loop on side=%s", side)
         player.stop()
         player.play()
 
     def _stop_vlc(self, side: str) -> None:
         player = self._vlc_player_for_side(side)
         if player is not None:
+            LOGGER.debug("Stopping VLC on side=%s", side)
             player.stop()
             try:
                 player.set_media(None)
@@ -1006,6 +1059,7 @@ class ImageRankerApp:
         if player is None:
             return False
 
+        LOGGER.debug("Starting VLC playback side=%s file=%s", side, path.name)
         self.left_image_label.lower() if side == "left" else self.right_image_label.lower()
         self._bind_vlc_to_widget(player, media_frame)
         media = self._vlc_instance.media_new_path(os.fspath(path))
@@ -1041,6 +1095,7 @@ class ImageRankerApp:
         w = max(widget.winfo_width(), 200)
         h = max(widget.winfo_height(), 200)
         target_size = _bucket_size((w, h))
+        LOGGER.debug("Setting media side=%s file=%s widget=%sx%s target=%s", side, path.name, w, h, target_size)
         self._stop_animation(side)
         self._stop_vlc(side)
         self._load_generation[side] += 1
@@ -1059,13 +1114,29 @@ class ImageRankerApp:
             return
 
         def worker() -> None:
+            started = time.perf_counter()
             frame_data = load_media_frames(path, target_size)
+            LOGGER.debug(
+                "Decoded frame_data side=%s file=%s frames=%d elapsed=%.3fs",
+                side,
+                path.name,
+                len(frame_data),
+                time.perf_counter() - started,
+            )
 
             def apply_result() -> None:
                 if load_generation != self._load_generation[side]:
+                    LOGGER.debug(
+                        "Dropping stale media update side=%s file=%s load_generation=%d current=%d",
+                        side,
+                        path.name,
+                        load_generation,
+                        self._load_generation[side],
+                    )
                     return
 
                 if not frame_data:
+                    LOGGER.debug("No frame data returned side=%s file=%s", side, path.name)
                     return
 
                 first_photo = ImageTk.PhotoImage(frame_data[0][0])
@@ -1277,7 +1348,20 @@ class ImageRankerApp:
         return renamed, skipped
 
 
-def main() -> None:
+def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Pairwise media ranker with Glicko-2 ratings.")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable verbose debug logging for media loading and transitions.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: List[str] | None = None) -> None:
+    args = parse_args(argv)
+    configure_logging(debug=args.debug)
+    LOGGER.info("Application starting (debug=%s)", args.debug)
     root = tk.Tk()
     app = ImageRankerApp(root)
     root.mainloop()

@@ -40,6 +40,10 @@ class MediaHelpersTests(unittest.TestCase):
         self.assertIn("--no-audio", media_glicko2.VLC_INSTANCE_OPTIONS)
         self.assertIn("--aout=dummy", media_glicko2.VLC_INSTANCE_OPTIONS)
 
+    def test_parse_args_debug_flag(self):
+        args = media_glicko2.parse_args(["--debug"])
+        self.assertTrue(args.debug)
+
     def test_load_images_ignores_cache_dir_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             folder = Path(tmpdir)

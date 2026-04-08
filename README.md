@@ -69,6 +69,12 @@ From the project directory:
 python media-glicko2.py
 ```
 
+Enable debug logs (useful for diagnosing transition freezes):
+
+```bash
+python media-glicko2.py --debug
+```
+
 ## Usage
 
 1. Launch the app.
