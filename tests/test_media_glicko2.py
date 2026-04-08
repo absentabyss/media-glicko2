@@ -36,6 +36,10 @@ class MediaHelpersTests(unittest.TestCase):
         self.assertIn(".mp4", media_glicko2.SUPPORTED_EXTS)
         self.assertIn(".webm", media_glicko2.SUPPORTED_EXTS)
 
+    def test_vlc_is_configured_for_silent_playback(self):
+        self.assertIn("--no-audio", media_glicko2.VLC_INSTANCE_OPTIONS)
+        self.assertIn("--aout=dummy", media_glicko2.VLC_INSTANCE_OPTIONS)
+
     def test_load_images_ignores_cache_dir_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             folder = Path(tmpdir)
