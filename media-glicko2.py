@@ -59,6 +59,10 @@ except ImportError:
 
 VLC_AVAILABLE = importlib.util.find_spec("vlc") is not None
 vlc = importlib.import_module("vlc") if VLC_AVAILABLE else None
+VLC_INSTANCE_OPTIONS = (
+    "--no-audio",
+    "--aout=dummy",
+)
 
 
 # =========================
@@ -585,7 +589,7 @@ class ImageRankerApp:
 
         self.left_photo = None
         self.right_photo = None
-        self._vlc_instance = vlc.Instance() if VLC_AVAILABLE else None
+        self._vlc_instance = self._create_vlc_instance()
         self.left_vlc_player = None
         self.right_vlc_player = None
         self.left_vlc_media = None
@@ -701,6 +705,14 @@ class ImageRankerApp:
         self.master.bind("<Down>", lambda e: self.undo_last())
         self.master.bind("<Configure>", self._on_resize)
         self.master.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _create_vlc_instance(self):
+        if not VLC_AVAILABLE:
+            return None
+        try:
+            return vlc.Instance(*VLC_INSTANCE_OPTIONS)
+        except Exception:
+            return None
 
     def _on_close(self) -> None:
         self._stop_animation("left")
@@ -949,6 +961,7 @@ class ImageRankerApp:
         self.left_image_label.lower() if side == "left" else self.right_image_label.lower()
         self._bind_vlc_to_widget(player, media_frame)
         media = self._vlc_instance.media_new_path(os.fspath(path))
+        media.add_option(":no-audio")
         player.set_media(media)
         player.audio_set_mute(True)
         em = player.event_manager()
