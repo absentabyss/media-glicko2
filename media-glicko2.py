@@ -37,6 +37,7 @@ import random
 import re
 import sys
 import threading
+import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -219,6 +220,8 @@ VIDEO_CACHE_TARGET_FPS = 14.0
 VIDEO_PRELOAD_LOOKAHEAD = 8
 DISPLAY_SIZE_BUCKET = 64
 PHOTOIMAGE_BATCH_SIZE = 6
+RENAME_RETRY_ATTEMPTS = 8
+RENAME_RETRY_DELAY_SECONDS = 0.15
 
 # Example prefix:
 # "[G2_R1500.0_RD200.3_S0.0600] "
@@ -241,6 +244,31 @@ def player_from_path(path: Path) -> Glicko2Player:
     rd = float(m.group(2))
     sigma = float(m.group(3))
     return Glicko2Player(rating=rating, rd=rd, sigma=sigma)
+
+
+def _rename_with_retry(src: Path, dst: Path) -> None:
+    """
+    Rename a file while tolerating brief Windows sharing violations
+    (WinError 32) that can happen right after media playback stops.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(RENAME_RETRY_ATTEMPTS):
+        try:
+            src.rename(dst)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            if attempt == RENAME_RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(RENAME_RETRY_DELAY_SECONDS)
+        except OSError as exc:
+            last_exc = exc
+            is_windows_lock = getattr(exc, "winerror", None) == 32
+            if (not is_windows_lock) or attempt == RENAME_RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(RENAME_RETRY_DELAY_SECONDS)
+    if last_exc is not None:
+        raise last_exc
 
 
 def load_images(folder: Path) -> List[Path]:
@@ -947,6 +975,10 @@ class ImageRankerApp:
         player = self._vlc_player_for_side(side)
         if player is not None:
             player.stop()
+            try:
+                player.set_media(None)
+            except Exception:
+                pass
         self._set_vlc_media_for_side(side, None)
 
     def _play_video_on_frame(self, path: Path, side: str) -> bool:
@@ -1218,13 +1250,13 @@ class ImageRankerApp:
                     temp_plan.append((src, final_dst))
                     continue
                 temp = src.with_name(src.name + f".__g2tmp__{i}")
-                src.rename(temp)
+                _rename_with_retry(src, temp)
                 temp_plan.append((temp, final_dst))
 
             for current_src, final_dst in temp_plan:
                 if current_src == final_dst:
                     continue
-                current_src.rename(final_dst)
+                _rename_with_retry(current_src, final_dst)
                 renamed += 1
 
         except Exception as exc:
