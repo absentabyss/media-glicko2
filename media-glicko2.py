@@ -1325,6 +1325,21 @@ class ImageRankerApp:
                     LOGGER.debug("Async VLC stop error side=%s", s, exc_info=True)
             threading.Thread(target=_do_stop, name=f"VLCStop-{side}", daemon=True).start()
 
+    def _pause_vlc(self, side: str) -> None:
+        """Pause the VLC player for a side without destroying it.
+
+        Keeps the player alive and bound to its HWND so the next video can
+        resume with set_media()+play() on the same object, avoiding any
+        HWND rebind or player recreation.  player.pause() is non-blocking.
+        """
+        self._invalidate_vlc_play_probes(side)
+        player = self._vlc_player_for_side(side)
+        if player is not None:
+            try:
+                player.pause()
+            except Exception:
+                LOGGER.debug("VLC pause error side=%s", side, exc_info=True)
+
     def _play_video_on_frame(self, path: Path, side: str, load_generation: int) -> bool:
         if not self._vlc_enabled or self._vlc_instance is None:
             return False
@@ -1419,9 +1434,12 @@ class ImageRankerApp:
         if path.suffix.lower() in SUPPORTED_VIDEO_EXTS and self._play_video_on_frame(path, side, load_generation):
             return
 
-        # Image / GIF path — stop any VLC player that was running on this side.
-        # _stop_vlc is now async so this returns immediately.
-        self._stop_vlc(side)
+        # Image / GIF path.  Pause the VLC player (non-blocking) rather than
+        # stopping it.  Stopping clears the player reference, so the next video
+        # would create a new player and bind it to the same HWND — causing the
+        # floating-window conflict we fixed.  Pausing keeps the player alive and
+        # bound; the next video just calls set_media()+play() on the same object.
+        self._pause_vlc(side)
 
         def worker() -> None:
             started = time.perf_counter()
