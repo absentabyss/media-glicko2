@@ -197,6 +197,9 @@ SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 SUPPORTED_EXTS = SUPPORTED_IMAGE_EXTS | SUPPORTED_VIDEO_EXTS
 VIDEO_FRAME_CACHE: Dict[Tuple[Path, Tuple[int, int], int], List[Tuple[Image.Image, int]]] = {}
 VIDEO_SOURCE_FRAME_CACHE: Dict[Tuple[Path, str], List[Tuple[Image.Image, int]]] = {}
+# Per-key events used to deduplicate concurrent loads of the same video.
+_FRAME_LOAD_EVENTS: Dict[Tuple, threading.Event] = {}
+_FRAME_LOAD_EVENTS_LOCK = threading.Lock()
 VIDEO_CACHE_DIR_NAME = ".g2cache"
 VIDEO_CACHE_VERSION = 1
 VIDEO_COMPILE_SIZE = (1200, 1200)
@@ -487,6 +490,26 @@ def load_media_frames(path: Path, target_size: Tuple[int, int], max_frames: int 
     if cached is not None:
         return cached
 
+    # Deduplication: if another thread is already loading the same key, wait for
+    # it to finish instead of duplicating the work.  This lets the display thread
+    # "inherit" an in-progress preload rather than restarting from scratch.
+    with _FRAME_LOAD_EVENTS_LOCK:
+        cached = VIDEO_FRAME_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        existing = _FRAME_LOAD_EVENTS.get(cache_key)
+        if existing is not None:
+            wait_event = existing
+            is_owner = False
+        else:
+            wait_event = threading.Event()
+            _FRAME_LOAD_EVENTS[cache_key] = wait_event
+            is_owner = True
+
+    if not is_owner:
+        wait_event.wait(timeout=30)
+        return VIDEO_FRAME_CACHE.get(cache_key) or []
+
     try:
         if suffix == ".gif":
             frames = _load_gif_frames(path, target_size, max_frames=max_frames)
@@ -523,6 +546,10 @@ def load_media_frames(path: Path, target_size: Tuple[int, int], max_frames: int 
         fallback_frames = [(fallback, 100)]
         VIDEO_FRAME_CACHE[cache_key] = fallback_frames
         return fallback_frames
+    finally:
+        with _FRAME_LOAD_EVENTS_LOCK:
+            _FRAME_LOAD_EVENTS.pop(cache_key, None)
+        wait_event.set()
 
 
 def build_random_pairs_once(paths: List[Path]) -> List[Tuple[Path, Path]]:
@@ -788,19 +815,46 @@ class ImageRankerApp:
         return ordered
 
     def _start_preload_upcoming_videos(self, lookahead: int = VIDEO_PRELOAD_LOOKAHEAD) -> None:
-        if not self.folder:
-            return
-        targets = self._upcoming_video_paths(lookahead=lookahead)
-        if not targets:
+        if not self.folder or not self.pairs:
             return
         self._preload_generation += 1
         generation = self._preload_generation
 
+        # Skip the current pair — its videos are already being loaded by the
+        # display threads.  Start immediately on pair N+1 so it has the most
+        # time to finish before the user advances.
+        seen: set = set()
+        upcoming: List[List[Path]] = []
+        start = self.current_index + 1
+        end = min(start + lookahead, len(self.pairs))
+        for pair_index in range(start, end):
+            left_path, right_path = self.pairs[pair_index]
+            pair_videos = [
+                p for p in (left_path, right_path)
+                if p.suffix.lower() in SUPPORTED_VIDEO_EXTS and p not in seen
+            ]
+            for p in pair_videos:
+                seen.add(p)
+            if pair_videos:
+                upcoming.append(pair_videos)
+
+        if not upcoming:
+            return
+
         def worker() -> None:
-            for path in targets:
+            for pair_videos in upcoming:
                 if generation != self._preload_generation:
                     return
-                self._preload_video_to_ram(path)
+                # Preload both sides of the pair in parallel so the pair is
+                # ready in max(left_time, right_time) instead of their sum.
+                threads = [
+                    threading.Thread(target=self._preload_video_to_ram, args=(p,), daemon=True)
+                    for p in pair_videos
+                ]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
 
         threading.Thread(target=worker, daemon=True).start()
 
