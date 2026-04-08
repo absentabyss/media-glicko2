@@ -1,4 +1,5 @@
 import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ MODULE_PATH = Path(__file__).resolve().parents[1] / "media-glicko2.py"
 spec = importlib.util.spec_from_file_location("media_glicko2", MODULE_PATH)
 media_glicko2 = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
+sys.modules[spec.name] = media_glicko2
 spec.loader.exec_module(media_glicko2)
 
 
@@ -51,6 +53,66 @@ class MediaHelpersTests(unittest.TestCase):
             for image, delay in frames:
                 self.assertEqual(image.size, (150, 150))
                 self.assertGreaterEqual(delay, 16)
+
+    def test_strip_existing_prefix_removes_stats_prefix(self):
+        stem = "[G2_R1525.4_RD300.0_S0.0600] sunset_photo"
+        stripped = media_glicko2.strip_existing_prefix(stem)
+        self.assertEqual(stripped, "sunset_photo")
+
+    def test_strip_existing_prefix_removes_stats_prefix_without_space(self):
+        stem = "[G2_R1525.4_RD300.0_S0.0600]sunset_photo"
+        stripped = media_glicko2.strip_existing_prefix(stem)
+        self.assertEqual(stripped, "sunset_photo")
+
+    def test_player_from_path_parses_existing_rating_metadata(self):
+        path = Path("[G2_R1688.5_RD88.2_S0.0475] image.png")
+        player = media_glicko2.player_from_path(path)
+        self.assertAlmostEqual(player.rating, 1688.5)
+        self.assertAlmostEqual(player.rd, 88.2)
+        self.assertAlmostEqual(player.sigma, 0.0475)
+
+    def test_player_from_path_parses_metadata_without_space_after_prefix(self):
+        path = Path("[G2_R1688.5_RD88.2_S0.0475]image.png")
+        player = media_glicko2.player_from_path(path)
+        self.assertAlmostEqual(player.rating, 1688.5)
+        self.assertAlmostEqual(player.rd, 88.2)
+        self.assertAlmostEqual(player.sigma, 0.0475)
+
+    def test_update_glicko2_player_with_no_matches_increases_rd_only(self):
+        player = media_glicko2.Glicko2Player(rating=1600.0, rd=50.0, sigma=0.06)
+        original_rating = player.rating
+        original_sigma = player.sigma
+
+        media_glicko2.update_glicko2_player(player)
+
+        self.assertEqual(player.rating, original_rating)
+        self.assertEqual(player.sigma, original_sigma)
+        self.assertGreater(player.rd, 50.0)
+        self.assertLessEqual(player.rd, 350.0)
+
+    def test_update_glicko2_player_win_against_equal_opponent_increases_rating(self):
+        player = media_glicko2.Glicko2Player(rating=1500.0, rd=200.0, sigma=0.06)
+        player.add_result(opponent_rating=1500.0, opponent_rd=200.0, score=1.0)
+
+        media_glicko2.update_glicko2_player(player)
+
+        self.assertGreater(player.rating, 1500.0)
+        self.assertLess(player.rd, 200.0)
+        self.assertGreater(player.sigma, 0.0)
+
+    def test_build_random_pairs_once_uses_each_path_at_most_once(self):
+        paths = [Path(f"image_{i}.png") for i in range(7)]
+        pairs = media_glicko2.build_random_pairs_once(paths)
+
+        paired_items = [item for pair in pairs for item in pair]
+        self.assertEqual(len(paired_items), len(set(paired_items)))
+        self.assertEqual(len(paired_items), 6)
+
+    def test_shorten_name_adds_ellipsis_for_long_names(self):
+        long_name = "a" * 120
+        shortened = media_glicko2.shorten_name(long_name, max_len=20)
+        self.assertEqual(len(shortened), 20)
+        self.assertIn("...", shortened)
 
 
 if __name__ == "__main__":
