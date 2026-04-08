@@ -75,6 +75,8 @@ Enable debug logs (useful for diagnosing transition freezes):
 python media-glicko2.py --debug
 ```
 
+With `--debug`, VLC lifecycle diagnostics are logged along with timed post-play probes, main-thread call watchdogs, recent UI phase history, and watchdog-triggered main-thread stack dumps to help pinpoint transition stalls.
+
 ## Usage
 
 1. Launch the app.
@@ -124,7 +126,9 @@ Because of this, rankings are relative to the **current pool** and naturally tra
 ## Limitations / notes
 
 - Updates are batch-applied at session end; if you close mid-session, that session’s uncommitted comparisons are not persisted.
+- VLC playback is the default path on all platforms and is recommended for best performance.
 - On Windows, native VLC uses DirectDraw video output and disables hardware decode to reduce lockups seen on some setups when rapidly switching videos.
+- When VLC is active, software video preloading is skipped to avoid VP8 decoder contention during rapid transitions.
 - Video playback uses `imageio` + `imageio-ffmpeg`; if videos still fail, re-encode with H.264/AAC in MP4 for best compatibility.
 - Very long media files are sampled to a capped number of frames to keep UI responsive.
 

@@ -27,6 +27,7 @@ Supported formats:
 
 from __future__ import annotations
 
+from collections import deque
 import hashlib
 import importlib
 import importlib.util
@@ -39,6 +40,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 import warnings
 import argparse
 from dataclasses import dataclass, field
@@ -67,6 +69,22 @@ VLC_INSTANCE_OPTIONS = (
     "--aout=dummy",
 )
 LOGGER = logging.getLogger("media_glicko2")
+VLC_STATE_NAMES = {
+    0: "NothingSpecial",
+    1: "Opening",
+    2: "Buffering",
+    3: "Playing",
+    4: "Paused",
+    5: "Stopped",
+    6: "Ended",
+    7: "Error",
+}
+VLC_PLAY_PROBE_DELAYS_MS = (0.15, 0.5, 1.5, 4.0)
+UI_HEARTBEAT_INTERVAL_MS = 500
+UI_HEARTBEAT_STALE_SECONDS = 3.0
+UI_WATCHDOG_POLL_SECONDS = 1.0
+MAINTHREAD_CALL_WATCHDOG_DELAYS_SECONDS = (0.25, 1.0, 3.0)
+UI_PHASE_HISTORY_LIMIT = 40
 
 
 def configure_logging(debug: bool = False) -> None:
@@ -648,7 +666,8 @@ class ImageRankerApp:
 
         self.left_photo = None
         self.right_photo = None
-        self._vlc_instance = self._create_vlc_instance()
+        self._vlc_enabled = VLC_AVAILABLE
+        self._vlc_instance = self._create_vlc_instance() if VLC_AVAILABLE else None
         self.left_vlc_player = None
         self.right_vlc_player = None
         self.left_vlc_media = None
@@ -664,8 +683,22 @@ class ImageRankerApp:
         self._resize_after_id = None
         self._last_root_size = (self.master.winfo_width(), self.master.winfo_height())
         self._load_generation: Dict[str, int] = {"left": 0, "right": 0}
+        self._vlc_probe_tokens: Dict[str, int] = {"left": 0, "right": 0}
+        self._vlc_media_mrl: Dict[str, str | None] = {"left": None, "right": None}
+        self._ui_heartbeat_after_id = None
+        self._ui_heartbeat_counter = 0
+        self._ui_heartbeat_timestamp = time.perf_counter()
+        self._watchdog_stop = threading.Event()
+        self._main_thread_ident = threading.get_ident()
+        self._ui_phase_lock = threading.Lock()
+        self._ui_phase = "startup"
+        self._ui_phase_started_at = time.perf_counter()
+        self._ui_phase_seq = 0
+        self._ui_phase_history = deque(maxlen=UI_PHASE_HISTORY_LIMIT)
         self._preload_lock = threading.Lock()
         self._preload_generation = 0
+        self._set_ui_phase("app-init")
+        self._start_ui_watchdog()
 
         self.top_bar = tk.Frame(self.master, bg="#202020")
         self.top_bar.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
@@ -766,7 +799,7 @@ class ImageRankerApp:
         self.master.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _create_vlc_instance(self):
-        if not VLC_AVAILABLE:
+        if not self._vlc_enabled:
             return None
         instance_options = list(VLC_INSTANCE_OPTIONS)
         if sys.platform.startswith("win"):
@@ -785,6 +818,12 @@ class ImageRankerApp:
             return None
 
     def _on_close(self) -> None:
+        self._watchdog_stop.set()
+        self._invalidate_vlc_play_probes("left")
+        self._invalidate_vlc_play_probes("right")
+        if self._ui_heartbeat_after_id is not None:
+            self.master.after_cancel(self._ui_heartbeat_after_id)
+            self._ui_heartbeat_after_id = None
         self._stop_animation("left")
         self._stop_animation("right")
         self._stop_vlc("left")
@@ -856,6 +895,13 @@ class ImageRankerApp:
             return
 
         left_path, right_path = self.pairs[self.current_index]
+        self._set_ui_phase(
+            "show-current-pair",
+            index=self.current_index + 1,
+            redraw_only=redraw_only,
+            left=left_path.name,
+            right=right_path.name,
+        )
         LOGGER.debug(
             "Showing pair index=%d/%d redraw_only=%s left=%s right=%s",
             self.current_index + 1,
@@ -894,6 +940,11 @@ class ImageRankerApp:
         return ordered
 
     def _start_preload_upcoming_videos(self, lookahead: int = VIDEO_PRELOAD_LOOKAHEAD) -> None:
+        if self._vlc_enabled:
+            # VLC is the active playback path. Avoid parallel software decoding
+            # of upcoming videos, which can contend with VLC's VP8 decode on
+            # Windows and cause stalls during rapid media switches.
+            return
         if not self.folder or not self.pairs:
             return
         self._preload_generation += 1
@@ -999,6 +1050,205 @@ class ImageRankerApp:
             self.left_vlc_media = media
         else:
             self.right_vlc_media = media
+        media_mrl = None
+        if media is not None:
+            try:
+                media_mrl = media.get_mrl()
+            except Exception:
+                media_mrl = None
+        self._vlc_media_mrl[side] = media_mrl
+
+    def _set_ui_phase(self, phase: str, **details: object) -> None:
+        detail_parts = [f"{key}={details[key]}" for key in sorted(details)]
+        now = time.perf_counter()
+        thread_name = threading.current_thread().name
+        with self._ui_phase_lock:
+            previous_phase = self._ui_phase
+            previous_started_at = self._ui_phase_started_at
+            self._ui_phase = phase
+            self._ui_phase_started_at = now
+            self._ui_phase_seq += 1
+            entry = f"{self._ui_phase_seq}:{phase} thread={thread_name}"
+            if detail_parts:
+                entry += " " + " ".join(detail_parts)
+            self._ui_phase_history.append(entry)
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
+                "UI phase seq=%d phase=%s prev=%s prev_age=%.3fs %s",
+                self._ui_phase_seq,
+                phase,
+                previous_phase,
+                now - previous_started_at,
+                " ".join(detail_parts),
+            )
+
+    def _dump_main_thread_state(self, reason: str) -> None:
+        with self._ui_phase_lock:
+            current_phase = self._ui_phase
+            phase_age = time.perf_counter() - self._ui_phase_started_at
+            history = list(self._ui_phase_history)
+        LOGGER.warning(
+            "Main thread dump reason=%s phase=%s phase_age=%.3fs pair_index=%d total_pairs=%d load_generation=%s vlc_media_left=%s vlc_media_right=%s",
+            reason,
+            current_phase,
+            phase_age,
+            self.current_index,
+            len(self.pairs),
+            dict(self._load_generation),
+            self._vlc_media_mrl["left"],
+            self._vlc_media_mrl["right"],
+        )
+        for entry in history[-10:]:
+            LOGGER.warning("UI phase history %s", entry)
+        frame = sys._current_frames().get(self._main_thread_ident)
+        if frame is None:
+            LOGGER.warning("Main thread stack unavailable reason=%s", reason)
+            return
+        for line in "".join(traceback.format_stack(frame)).rstrip().splitlines():
+            LOGGER.warning("Main thread stack %s", line)
+
+    def _run_mainthread_call_with_watchdog(self, label: str, func):
+        if threading.get_ident() != self._main_thread_ident or not LOGGER.isEnabledFor(logging.DEBUG):
+            return func()
+
+        self._set_ui_phase("mainthread-call-start", label=label)
+        started = time.perf_counter()
+        stop_event = threading.Event()
+
+        def monitor() -> None:
+            last_delay = 0.0
+            for delay in MAINTHREAD_CALL_WATCHDOG_DELAYS_SECONDS:
+                if stop_event.wait(delay - last_delay):
+                    return
+                LOGGER.warning("Main-thread call blocked label=%s elapsed=%.3fs", label, delay)
+                self._dump_main_thread_state(f"blocked-call:{label}")
+                last_delay = delay
+
+        threading.Thread(target=monitor, name="MainThreadCallWatchdog", daemon=True).start()
+        try:
+            return func()
+        finally:
+            stop_event.set()
+            self._set_ui_phase(
+                "mainthread-call-end",
+                label=label,
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+            )
+
+    def _tick_ui_heartbeat(self) -> None:
+        if self._watchdog_stop.is_set():
+            self._ui_heartbeat_after_id = None
+            return
+        self._ui_heartbeat_counter += 1
+        self._ui_heartbeat_timestamp = time.perf_counter()
+        self._ui_heartbeat_after_id = self.master.after(UI_HEARTBEAT_INTERVAL_MS, self._tick_ui_heartbeat)
+
+    def _start_ui_watchdog(self) -> None:
+        self._tick_ui_heartbeat()
+
+        def watchdog_loop() -> None:
+            stale_reported = False
+            while not self._watchdog_stop.wait(UI_WATCHDOG_POLL_SECONDS):
+                age = time.perf_counter() - self._ui_heartbeat_timestamp
+                if age >= UI_HEARTBEAT_STALE_SECONDS:
+                    if not stale_reported:
+                        self._set_ui_phase("ui-heartbeat-stalled", age_ms=int(age * 1000))
+                        LOGGER.warning(
+                            "UI heartbeat stalled age=%.3fs counter=%d",
+                            age,
+                            self._ui_heartbeat_counter,
+                        )
+                        self._dump_main_thread_state("ui-heartbeat-stalled")
+                        stale_reported = True
+                elif stale_reported:
+                    self._set_ui_phase("ui-heartbeat-recovered", age_ms=int(age * 1000))
+                    LOGGER.debug(
+                        "UI heartbeat recovered age=%.3fs counter=%d",
+                        age,
+                        self._ui_heartbeat_counter,
+                    )
+                    stale_reported = False
+
+        threading.Thread(target=watchdog_loop, name="UIWatchdog", daemon=True).start()
+
+    def _invalidate_vlc_play_probes(self, side: str) -> int:
+        self._vlc_probe_tokens[side] += 1
+        return self._vlc_probe_tokens[side]
+
+    def _log_vlc_event(self, side: str, event_name: str) -> None:
+        if not LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        LOGGER.debug(
+            "VLC event side=%s event=%s thread=%s media=%s",
+            side,
+            event_name,
+            threading.current_thread().name,
+            self._vlc_media_mrl[side],
+        )
+
+    def _schedule_vlc_play_probes(self, side: str, path: Path, load_generation: int) -> None:
+        probe_token = self._invalidate_vlc_play_probes(side)
+        started = time.perf_counter()
+        for delay_seconds in VLC_PLAY_PROBE_DELAYS_MS:
+            def probe(delay_seconds: float = delay_seconds, token: int = probe_token) -> None:
+                time.sleep(delay_seconds)
+                if token != self._vlc_probe_tokens[side]:
+                    LOGGER.debug(
+                        "Skipping VLC probe side=%s file=%s delay_ms=%d stale_token=%d current=%d",
+                        side,
+                        path.name,
+                        int(delay_seconds * 1000),
+                        token,
+                        self._vlc_probe_tokens[side],
+                    )
+                    return
+                if load_generation != self._load_generation[side]:
+                    LOGGER.debug(
+                        "Skipping VLC probe side=%s file=%s delay_ms=%d stale_generation=%d current=%d",
+                        side,
+                        path.name,
+                        int(delay_seconds * 1000),
+                        load_generation,
+                        self._load_generation[side],
+                    )
+                    return
+                self._log_vlc_state(
+                    side,
+                    f"probe delay_ms={int(delay_seconds * 1000)} elapsed={time.perf_counter() - started:.3f}s file={path.name}",
+                )
+
+            threading.Thread(target=probe, name=f"VLCProbe-{side}", daemon=True).start()
+
+    def _log_vlc_state(self, side: str, prefix: str) -> None:
+        if not LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        player = self._vlc_player_for_side(side)
+        if player is None:
+            LOGGER.debug("VLC state side=%s %s player=None", side, prefix)
+            return
+        try:
+            state_obj = player.get_state()
+            state_val = int(state_obj)
+            state_name = VLC_STATE_NAMES.get(state_val, str(state_obj))
+        except Exception:
+            state_name = "unknown"
+        try:
+            media = player.get_media()
+            media_mrl = media.get_mrl() if media is not None else None
+        except Exception:
+            media_mrl = None
+        try:
+            is_playing = bool(player.is_playing())
+        except Exception:
+            is_playing = False
+        LOGGER.debug(
+            "VLC state side=%s %s state=%s playing=%s media=%s",
+            side,
+            prefix,
+            state_name,
+            is_playing,
+            media_mrl,
+        )
 
     def _ensure_vlc_player(self, side: str):
         if not self._vlc_instance:
@@ -1007,22 +1257,41 @@ class ImageRankerApp:
         if player is None:
             player = self._vlc_instance.media_player_new()
             em = player.event_manager()
+            def _event_log(event_name: str):
+                return lambda _event, s=side, n=event_name: self._log_vlc_event(s, n)
             em.event_attach(
                 vlc.EventType.MediaPlayerEndReached,
                 lambda _event: self.master.after(0, lambda: self._restart_vlc(side)),
             )
+            em.event_attach(vlc.EventType.MediaPlayerEncounteredError, _event_log("EncounteredError"))
+            em.event_attach(vlc.EventType.MediaPlayerOpening, _event_log("Opening"))
+            em.event_attach(vlc.EventType.MediaPlayerBuffering, _event_log("Buffering"))
+            em.event_attach(vlc.EventType.MediaPlayerPlaying, _event_log("Playing"))
+            em.event_attach(vlc.EventType.MediaPlayerPaused, _event_log("Paused"))
             self._set_vlc_player_for_side(side, player)
         return player
 
     def _bind_vlc_to_widget(self, player, widget: tk.Widget) -> None:
-        widget.update_idletasks()
+        self._run_mainthread_call_with_watchdog(
+            "widget.update_idletasks bind-vlc",
+            widget.update_idletasks,
+        )
         handle = widget.winfo_id()
         if sys.platform.startswith("win"):
-            player.set_hwnd(handle)
+            self._run_mainthread_call_with_watchdog(
+                f"player.set_hwnd handle={handle}",
+                lambda: player.set_hwnd(handle),
+            )
         elif sys.platform == "darwin":
-            player.set_nsobject(handle)
+            self._run_mainthread_call_with_watchdog(
+                f"player.set_nsobject handle={handle}",
+                lambda: player.set_nsobject(handle),
+            )
         else:
-            player.set_xwindow(handle)
+            self._run_mainthread_call_with_watchdog(
+                f"player.set_xwindow handle={handle}",
+                lambda: player.set_xwindow(handle),
+            )
 
     def _restart_vlc(self, side: str) -> None:
         player = self._vlc_player_for_side(side)
@@ -1035,18 +1304,29 @@ class ImageRankerApp:
         player.play()
 
     def _stop_vlc(self, side: str) -> None:
+        self._invalidate_vlc_play_probes(side)
         player = self._vlc_player_for_side(side)
         if player is not None:
-            LOGGER.debug("Stopping VLC on side=%s", side)
-            player.stop()
+            self._set_ui_phase("stop-vlc", side=side, media=self._vlc_media_mrl[side])
+            LOGGER.debug("Stopping VLC on side=%s media=%s", side, self._vlc_media_mrl[side])
+            stop_started = time.perf_counter()
+            self._run_mainthread_call_with_watchdog(
+                f"vlc.stop side={side}",
+                player.stop,
+            )
+            LOGGER.debug("VLC stop side=%s elapsed=%.3fs", side, time.perf_counter() - stop_started)
             try:
-                player.set_media(None)
+                self._run_mainthread_call_with_watchdog(
+                    f"vlc.set_media_none side={side}",
+                    lambda: player.set_media(None),
+                )
+                LOGGER.debug("VLC set_media(None) succeeded on side=%s", side)
             except Exception:
-                pass
+                LOGGER.debug("VLC set_media(None) failed on side=%s", side, exc_info=True)
         self._set_vlc_media_for_side(side, None)
 
-    def _play_video_on_frame(self, path: Path, side: str) -> bool:
-        if not VLC_AVAILABLE or self._vlc_instance is None:
+    def _play_video_on_frame(self, path: Path, side: str, load_generation: int) -> bool:
+        if not self._vlc_enabled or self._vlc_instance is None:
             return False
 
         media_frame = self._media_frame_for_side(side)
@@ -1054,15 +1334,30 @@ class ImageRankerApp:
         if player is None:
             return False
 
+        self._set_ui_phase("play-vlc", side=side, file=path.name, load_generation=load_generation)
         LOGGER.debug("Starting VLC playback side=%s file=%s", side, path.name)
         self.left_image_label.lower() if side == "left" else self.right_image_label.lower()
         self._bind_vlc_to_widget(player, media_frame)
         media = self._vlc_instance.media_new_path(os.fspath(path))
         media.add_option(":no-audio")
-        player.set_media(media)
-        player.audio_set_mute(True)
-        player.play()
+        self._run_mainthread_call_with_watchdog(
+            f"vlc.set_media side={side} file={path.name}",
+            lambda: player.set_media(media),
+        )
         self._set_vlc_media_for_side(side, media)
+        player.audio_set_mute(True)
+        play_code = self._run_mainthread_call_with_watchdog(
+            f"vlc.play side={side} file={path.name}",
+            player.play,
+        )
+        LOGGER.debug(
+            "VLC play() returned side=%s file=%s code=%s media=%s",
+            side,
+            path.name,
+            play_code,
+            self._vlc_media_mrl[side],
+        )
+        self._schedule_vlc_play_probes(side, path, load_generation)
         return True
 
     def _advance_animation(self, side: str) -> None:
@@ -1086,7 +1381,11 @@ class ImageRankerApp:
             self.right_animation_after_id = self.master.after(delay, lambda: self._advance_animation("right"))
 
     def _set_media_on_label(self, path: Path, widget: tk.Label, side: str) -> None:
-        widget.update_idletasks()
+        self._set_ui_phase("set-media-start", side=side, file=path.name)
+        self._run_mainthread_call_with_watchdog(
+            f"widget.update_idletasks side={side}",
+            widget.update_idletasks,
+        )
         w = max(widget.winfo_width(), 200)
         h = max(widget.winfo_height(), 200)
         target_size = _bucket_size((w, h))
@@ -1095,6 +1394,13 @@ class ImageRankerApp:
         self._stop_vlc(side)
         self._load_generation[side] += 1
         load_generation = self._load_generation[side]
+        self._set_ui_phase(
+            "set-media-after-stop",
+            side=side,
+            file=path.name,
+            load_generation=load_generation,
+            target=target_size,
+        )
 
         placeholder = Image.new("RGB", (w, h), color=(24, 24, 24))
         placeholder_photo = ImageTk.PhotoImage(placeholder)
@@ -1105,7 +1411,7 @@ class ImageRankerApp:
             self.right_photo = placeholder_photo
         widget.lift()
 
-        if path.suffix.lower() in SUPPORTED_VIDEO_EXTS and self._play_video_on_frame(path, side):
+        if path.suffix.lower() in SUPPORTED_VIDEO_EXTS and self._play_video_on_frame(path, side, load_generation):
             return
 
         def worker() -> None:
@@ -1191,6 +1497,7 @@ class ImageRankerApp:
             return
 
         left_path, right_path = self.pairs[self.current_index]
+        self._set_ui_phase("pick-winner", side=side, left=left_path.name, right=right_path.name)
         left_player = self.players[left_path]
         right_player = self.players[right_path]
 
@@ -1215,6 +1522,7 @@ class ImageRankerApp:
             return
 
         left_path, right_path = self.pairs[self.current_index]
+        self._set_ui_phase("record-draw", left=left_path.name, right=right_path.name)
         left_player = self.players[left_path]
         right_player = self.players[right_path]
 
@@ -1232,6 +1540,7 @@ class ImageRankerApp:
         if not self.history or self.current_index == 0:
             return
 
+        self._set_ui_phase("undo-last", current_index=self.current_index)
         self.current_index -= 1
 
         left_path, right_path = self.history.pop()
@@ -1248,6 +1557,7 @@ class ImageRankerApp:
     def finish_session(self) -> None:
         if not self.image_paths:
             return
+        self._set_ui_phase("finish-session", image_count=len(self.image_paths))
         self._stop_animation("left")
         self._stop_animation("right")
         self._stop_vlc("left")
