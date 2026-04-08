@@ -28,10 +28,14 @@ Supported formats:
 from __future__ import annotations
 
 import hashlib
+import importlib
+import importlib.util
 import json
 import math
+import os
 import random
 import re
+import sys
 import threading
 import warnings
 from dataclasses import dataclass, field
@@ -52,6 +56,9 @@ try:
 except ImportError:
     imageio = None
     iio = None
+
+VLC_AVAILABLE = importlib.util.find_spec("vlc") is not None
+vlc = importlib.import_module("vlc") if VLC_AVAILABLE else None
 
 
 # =========================
@@ -591,6 +598,11 @@ class ImageRankerApp:
 
         self.left_photo = None
         self.right_photo = None
+        self._vlc_instance = vlc.Instance() if VLC_AVAILABLE else None
+        self.left_vlc_player = None
+        self.right_vlc_player = None
+        self.left_vlc_media = None
+        self.right_vlc_media = None
         self.left_animation_after_id = None
         self.right_animation_after_id = None
         self.left_animation_frames: List[ImageTk.PhotoImage] = []
@@ -661,12 +673,18 @@ class ImageRankerApp:
         )
         self.right_label.pack(side=tk.TOP, fill=tk.X, padx=10, pady=8)
 
-        self.left_image_label = tk.Label(self.left_panel, bg="#151515", cursor="hand2")
-        self.left_image_label.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.left_media_frame = tk.Frame(self.left_panel, bg="#151515", cursor="hand2")
+        self.left_media_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.left_media_frame.bind("<Button-1>", lambda e: self.pick_winner("left"))
+        self.left_image_label = tk.Label(self.left_media_frame, bg="#151515", cursor="hand2")
+        self.left_image_label.pack(fill=tk.BOTH, expand=True)
         self.left_image_label.bind("<Button-1>", lambda e: self.pick_winner("left"))
 
-        self.right_image_label = tk.Label(self.right_panel, bg="#151515", cursor="hand2")
-        self.right_image_label.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.right_media_frame = tk.Frame(self.right_panel, bg="#151515", cursor="hand2")
+        self.right_media_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.right_media_frame.bind("<Button-1>", lambda e: self.pick_winner("right"))
+        self.right_image_label = tk.Label(self.right_media_frame, bg="#151515", cursor="hand2")
+        self.right_image_label.pack(fill=tk.BOTH, expand=True)
         self.right_image_label.bind("<Button-1>", lambda e: self.pick_winner("right"))
 
         self.bottom_bar = tk.Frame(self.master, bg="#202020")
@@ -695,6 +713,14 @@ class ImageRankerApp:
         self.master.bind("<Up>", lambda e: self.record_draw())
         self.master.bind("<Down>", lambda e: self.undo_last())
         self.master.bind("<Configure>", self._on_resize)
+        self.master.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self) -> None:
+        self._stop_animation("left")
+        self._stop_animation("right")
+        self._stop_vlc("left")
+        self._stop_vlc("right")
+        self.master.destroy()
 
     def build_session_pairs(self, image_paths: List[Path]) -> List[Tuple[Path, Path]]:
         return build_random_pairs_once(image_paths)
@@ -901,6 +927,81 @@ class ImageRankerApp:
             self.right_animation_delays = []
             self.right_animation_index = 0
 
+    def _media_frame_for_side(self, side: str) -> tk.Frame:
+        return self.left_media_frame if side == "left" else self.right_media_frame
+
+    def _vlc_player_for_side(self, side: str):
+        return self.left_vlc_player if side == "left" else self.right_vlc_player
+
+    def _set_vlc_player_for_side(self, side: str, player) -> None:
+        if side == "left":
+            self.left_vlc_player = player
+        else:
+            self.right_vlc_player = player
+
+    def _set_vlc_media_for_side(self, side: str, media) -> None:
+        if side == "left":
+            self.left_vlc_media = media
+        else:
+            self.right_vlc_media = media
+
+    def _ensure_vlc_player(self, side: str):
+        if not self._vlc_instance:
+            return None
+        player = self._vlc_player_for_side(side)
+        if player is None:
+            player = self._vlc_instance.media_player_new()
+            self._set_vlc_player_for_side(side, player)
+        return player
+
+    def _bind_vlc_to_widget(self, player, widget: tk.Widget) -> None:
+        widget.update_idletasks()
+        handle = widget.winfo_id()
+        if sys.platform.startswith("win"):
+            player.set_hwnd(handle)
+        elif sys.platform == "darwin":
+            player.set_nsobject(handle)
+        else:
+            player.set_xwindow(handle)
+
+    def _restart_vlc(self, side: str) -> None:
+        player = self._vlc_player_for_side(side)
+        if player is None:
+            return
+        if player.get_media() is None:
+            return
+        player.stop()
+        player.play()
+
+    def _stop_vlc(self, side: str) -> None:
+        player = self._vlc_player_for_side(side)
+        if player is not None:
+            player.stop()
+        self._set_vlc_media_for_side(side, None)
+
+    def _play_video_on_frame(self, path: Path, side: str) -> bool:
+        if not VLC_AVAILABLE or self._vlc_instance is None:
+            return False
+
+        media_frame = self._media_frame_for_side(side)
+        player = self._ensure_vlc_player(side)
+        if player is None:
+            return False
+
+        self.left_image_label.lower() if side == "left" else self.right_image_label.lower()
+        self._bind_vlc_to_widget(player, media_frame)
+        media = self._vlc_instance.media_new_path(os.fspath(path))
+        player.set_media(media)
+        player.audio_set_mute(True)
+        em = player.event_manager()
+        em.event_attach(
+            vlc.EventType.MediaPlayerEndReached,
+            lambda _event: self.master.after(0, lambda: self._restart_vlc(side)),
+        )
+        player.play()
+        self._set_vlc_media_for_side(side, media)
+        return True
+
     def _advance_animation(self, side: str) -> None:
         if side == "left":
             frames = self.left_animation_frames
@@ -927,6 +1028,7 @@ class ImageRankerApp:
         h = max(widget.winfo_height(), 200)
         target_size = _bucket_size((w, h))
         self._stop_animation(side)
+        self._stop_vlc(side)
         self._load_generation[side] += 1
         load_generation = self._load_generation[side]
 
@@ -937,6 +1039,10 @@ class ImageRankerApp:
             self.left_photo = placeholder_photo
         else:
             self.right_photo = placeholder_photo
+        widget.lift()
+
+        if path.suffix.lower() in SUPPORTED_VIDEO_EXTS and self._play_video_on_frame(path, side):
+            return
 
         def worker() -> None:
             frame_data = load_media_frames(path, target_size)
