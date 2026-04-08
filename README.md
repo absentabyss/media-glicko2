@@ -52,6 +52,7 @@ Animated GIFs and videos are played in a loop while you compare a pair.
 - Python 3.10+
 - [Pillow](https://pypi.org/project/Pillow/)
 - [ImageIO](https://pypi.org/project/imageio/) (for video frame decoding)
+- [imageio-ffmpeg](https://pypi.org/project/imageio-ffmpeg/) (bundled ffmpeg backend, important on Windows)
 - Tkinter (usually included with standard Python installers)
 
 Install dependencies:
@@ -117,7 +118,7 @@ Because of this, rankings are relative to the **current pool** and naturally tra
 ## Limitations / notes
 
 - Updates are batch-applied at session end; if you close mid-session, that session’s uncommitted comparisons are not persisted.
-- Video playback requires `imageio` and a compatible local decoder stack.
+- Video playback uses `imageio` + `imageio-ffmpeg`; if videos still fail, re-encode with H.264/AAC in MP4 for best compatibility.
 - Very long media files are sampled to a capped number of frames to keep UI responsive.
 
 ## File overview
