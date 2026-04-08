@@ -709,8 +709,19 @@ class ImageRankerApp:
     def _create_vlc_instance(self):
         if not VLC_AVAILABLE:
             return None
+        instance_options = list(VLC_INSTANCE_OPTIONS)
+        if sys.platform.startswith("win"):
+            # Direct3D11 output is known to be unstable on some Windows setups
+            # when embedding VLC into GUI widgets and rapidly swapping media.
+            # Prefer DirectDraw and disable hardware decode to reduce lockups.
+            instance_options.extend(
+                [
+                    "--vout=directdraw",
+                    "--avcodec-hw=none",
+                ]
+            )
         try:
-            return vlc.Instance(*VLC_INSTANCE_OPTIONS)
+            return vlc.Instance(*instance_options)
         except Exception:
             return None
 
@@ -921,6 +932,11 @@ class ImageRankerApp:
         player = self._vlc_player_for_side(side)
         if player is None:
             player = self._vlc_instance.media_player_new()
+            em = player.event_manager()
+            em.event_attach(
+                vlc.EventType.MediaPlayerEndReached,
+                lambda _event: self.master.after(0, lambda: self._restart_vlc(side)),
+            )
             self._set_vlc_player_for_side(side, player)
         return player
 
@@ -964,11 +980,6 @@ class ImageRankerApp:
         media.add_option(":no-audio")
         player.set_media(media)
         player.audio_set_mute(True)
-        em = player.event_manager()
-        em.event_attach(
-            vlc.EventType.MediaPlayerEndReached,
-            lambda _event: self.master.after(0, lambda: self._restart_vlc(side)),
-        )
         player.play()
         self._set_vlc_media_for_side(side, media)
         return True

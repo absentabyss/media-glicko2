@@ -118,6 +118,7 @@ Because of this, rankings are relative to the **current pool** and naturally tra
 ## Limitations / notes
 
 - Updates are batch-applied at session end; if you close mid-session, that session’s uncommitted comparisons are not persisted.
+- On Windows, native VLC uses DirectDraw video output and disables hardware decode to reduce lockups seen on some setups when rapidly switching videos.
 - Video playback uses `imageio` + `imageio-ffmpeg`; if videos still fail, re-encode with H.264/AAC in MP4 for best compatibility.
 - Very long media files are sampled to a capped number of frames to keep UI responsive.
 
