@@ -202,6 +202,7 @@ VIDEO_CACHE_VERSION = 1
 VIDEO_COMPILE_SIZE = (1200, 1200)
 VIDEO_CACHE_MAX_FRAMES = 90
 VIDEO_CACHE_TARGET_FPS = 14.0
+VIDEO_PRELOAD_LOOKAHEAD = 8
 
 # Example prefix:
 # "[G2_R1500.0_RD200.3_S0.0600] "
@@ -562,6 +563,8 @@ class ImageRankerApp:
         self._resize_after_id = None
         self._last_root_size = (self.master.winfo_width(), self.master.winfo_height())
         self._load_generation: Dict[str, int] = {"left": 0, "right": 0}
+        self._preload_lock = threading.Lock()
+        self._preload_generation = 0
 
         self.top_bar = tk.Frame(self.master, bg="#202020")
         self.top_bar.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
@@ -682,6 +685,7 @@ class ImageRankerApp:
         self.compile_folder_videos()
         self._update_progress()
         self.show_current_pair()
+        self._start_preload_upcoming_videos()
 
     def compile_folder_videos(self) -> None:
         if not self.folder:
@@ -733,6 +737,7 @@ class ImageRankerApp:
         self._resize_after_id = None
         if self.pairs and self.current_index < len(self.pairs):
             self.show_current_pair(redraw_only=True)
+            self._start_preload_upcoming_videos()
 
     def show_current_pair(self, redraw_only: bool = False) -> None:
         if not self.pairs or self.current_index >= len(self.pairs):
@@ -750,6 +755,59 @@ class ImageRankerApp:
         self._set_media_on_label(right_path, self.right_image_label, side="right")
 
         self._update_progress()
+        self._start_preload_upcoming_videos()
+
+    def _upcoming_video_paths(self, lookahead: int = VIDEO_PRELOAD_LOOKAHEAD) -> List[Path]:
+        if not self.pairs or self.current_index >= len(self.pairs) or lookahead <= 0:
+            return []
+
+        ordered: List[Path] = []
+        seen = set()
+        end_index = min(self.current_index + lookahead, len(self.pairs))
+        for pair_index in range(self.current_index, end_index):
+            left_path, right_path = self.pairs[pair_index]
+            for candidate in (left_path, right_path):
+                if candidate.suffix.lower() not in SUPPORTED_VIDEO_EXTS:
+                    continue
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                ordered.append(candidate)
+        return ordered
+
+    def _start_preload_upcoming_videos(self, lookahead: int = VIDEO_PRELOAD_LOOKAHEAD) -> None:
+        if not self.folder:
+            return
+        targets = self._upcoming_video_paths(lookahead=lookahead)
+        if not targets:
+            return
+        self._preload_generation += 1
+        generation = self._preload_generation
+
+        def worker() -> None:
+            for path in targets:
+                if generation != self._preload_generation:
+                    return
+                self._preload_video_to_ram(path)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _preload_video_to_ram(self, path: Path) -> None:
+        if path.suffix.lower() not in SUPPORTED_VIDEO_EXTS:
+            return
+        cache_key = _compute_video_cache_key(path, compile_size=VIDEO_COMPILE_SIZE)
+        source_key = (path, cache_key)
+        with self._preload_lock:
+            if source_key in VIDEO_SOURCE_FRAME_CACHE:
+                return
+
+        if not _has_valid_video_cache(path):
+            _compile_video_cache(path)
+            if not _has_valid_video_cache(path):
+                return
+
+        # Load compile-sized frames to populate VIDEO_SOURCE_FRAME_CACHE.
+        _load_video_frames_from_cache(path, VIDEO_COMPILE_SIZE)
 
     def _stop_animation(self, side: str) -> None:
         if side == "left":
