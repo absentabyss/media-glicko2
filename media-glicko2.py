@@ -818,7 +818,6 @@ class ImageRankerApp:
         self.status_var.set(f"Loaded {len(self.image_paths)} images from: {self.folder}")
         self._update_progress()
         self.show_current_pair()
-        self._start_preload_upcoming_videos()
 
     def _update_progress(self) -> None:
         total_pairs = len(self.pairs)
@@ -849,7 +848,6 @@ class ImageRankerApp:
         self._resize_after_id = None
         if self.pairs and self.current_index < len(self.pairs):
             self.show_current_pair(redraw_only=True)
-            self._start_preload_upcoming_videos()
 
     def show_current_pair(self, redraw_only: bool = False) -> None:
         if not self.pairs or self.current_index >= len(self.pairs):
@@ -933,17 +931,14 @@ class ImageRankerApp:
                 if generation != self._preload_generation:
                     LOGGER.debug("Cancelling stale preload generation=%d", generation)
                     return
-                # Preload both sides of the pair in parallel so the pair is
-                # ready in max(left_time, right_time) instead of their sum.
+                # Keep decode work serial to avoid decoder lockups observed on
+                # some systems when multiple WebM files are decoded at once.
                 LOGGER.debug("Preloading pair videos generation=%d files=%s", generation, [p.name for p in pair_videos])
-                threads = [
-                    threading.Thread(target=self._preload_video_to_ram, args=(p,), daemon=True)
-                    for p in pair_videos
-                ]
-                for t in threads:
-                    t.start()
-                for t in threads:
-                    t.join()
+                for path in pair_videos:
+                    if generation != self._preload_generation:
+                        LOGGER.debug("Cancelling stale preload generation=%d", generation)
+                        return
+                    self._preload_video_to_ram(path)
 
         threading.Thread(target=worker, daemon=True).start()
 
