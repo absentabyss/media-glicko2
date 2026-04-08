@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 try:
@@ -66,6 +67,21 @@ class MediaHelpersTests(unittest.TestCase):
             for image, delay in frames:
                 self.assertEqual(image.size, (150, 150))
                 self.assertGreaterEqual(delay, 16)
+
+    def test_load_media_frames_for_video_returns_fallback_frame_when_decode_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "broken.webm"
+            video_path.write_bytes(b"not-a-real-video")
+
+            with patch.object(media_glicko2, "_load_video_frames", return_value=[]), patch.object(
+                media_glicko2.Image, "open", side_effect=OSError("bad file")
+            ):
+                frames = media_glicko2.load_media_frames(video_path, (120, 90))
+
+            self.assertEqual(len(frames), 1)
+            image, delay = frames[0]
+            self.assertEqual(image.size, (120, 90))
+            self.assertGreaterEqual(delay, 16)
 
     def test_strip_existing_prefix_removes_stats_prefix(self):
         stem = "[G2_R1525.4_RD300.0_S0.0600] sunset_photo"
