@@ -1265,12 +1265,14 @@ class ImageRankerApp:
         if old_player is not None:
             def _stop_old(p=old_player, s=side) -> None:
                 try:
+                    p.stop()
+                    # Detach AFTER stop — detaching while playing causes VLC to
+                    # open its own floating OS window to replace the lost HWND.
                     if sys.platform.startswith("win"):
                         try:
                             p.set_hwnd(0)
                         except Exception:
                             pass
-                    p.stop()
                     LOGGER.debug("Async old-player stop complete side=%s", s)
                 except Exception:
                     LOGGER.debug("Async old-player stop error side=%s", s, exc_info=True)
@@ -1327,12 +1329,14 @@ class ImageRankerApp:
             LOGGER.debug("Queueing async VLC stop side=%s", side)
             def _do_stop(p=player, s=side) -> None:
                 try:
+                    p.stop()
+                    # Detach AFTER stop — detaching while playing causes VLC to
+                    # open its own floating OS window to replace the lost HWND.
                     if sys.platform.startswith("win"):
                         try:
                             p.set_hwnd(0)
                         except Exception:
                             pass
-                    p.stop()
                     LOGGER.debug("Async VLC stop complete side=%s", s)
                 except Exception:
                     LOGGER.debug("Async VLC stop error side=%s", s, exc_info=True)
